@@ -413,7 +413,8 @@ static int heuristic(const int32_t *state, int grid)
 typedef struct open_node {
     int32_t *state;
     int32_t g;
-    int32_t f;
+    int32_t f;      /* search key: g + weight*scale*h */
+    int32_t h;      /* raw heuristic, kept for deterministic tie-breaking */
     int32_t blank;
     int32_t parent;      /* index into the node arena, -1 for the root */
     int8_t move_dx;
@@ -455,8 +456,15 @@ static int ih_less(const index_heap_t *heap, int32_t a, int32_t b)
 {
     const open_node_t *na = &heap->arena[a];
     const open_node_t *nb = &heap->arena[b];
+    /* Deterministic ordering: search key, then the heuristic itself (prefers nodes
+     * closer to the goal when the key ties, which is what makes a weight > 1 behave
+     * like a best-first search instead of degenerating to FIFO), then insertion
+     * order. Without the second key the result depends on heap layout. */
     if (na->f != nb->f) {
         return na->f < nb->f;
+    }
+    if (na->h != nb->h) {
+        return na->h < nb->h;
     }
     return na->order < nb->order;
 }
@@ -514,8 +522,12 @@ static int32_t ih_pop(index_heap_t *heap)
     return top;
 }
 
-int mnsp_solve(const int32_t *positions, int grid,
-               mnsp_move_t *out_moves, int capacity, uint64_t max_states)
+/* weight = 1 gives an optimal solution (exact A*). Larger weights bias the search
+ * towards the goal: the result is a valid but possibly longer path, found with far
+ * fewer expansions. `h` is kept unscaled so the heap can break ties on it. */
+static int solve_core(const int32_t *positions, int grid,
+                      mnsp_move_t *out_moves, int capacity, uint64_t max_states,
+                      double weight)
 {
     int cells;
     int32_t *goal = NULL;
@@ -529,6 +541,12 @@ int mnsp_solve(const int32_t *positions, int grid,
     if (positions == NULL || out_moves == NULL || grid < MNSP_MIN_GRID || grid > MNSP_MAX_GRID ||
         capacity < 0) {
         return -MNSP_ERR_INVALID_ARGUMENT;
+    }
+    if (!(weight >= 1.0)) {
+        weight = 1.0; /* also catches NaN */
+    }
+    if (weight > 100.0) {
+        weight = 100.0;
     }
     if (!mnsp_positions_valid(positions, grid)) {
         return -MNSP_ERR_INVALID_ARGUMENT;
@@ -566,7 +584,8 @@ int mnsp_solve(const int32_t *positions, int grid,
         memcpy(state, positions, (size_t)cells * sizeof(int32_t));
         root.state = state;
         root.g = 0;
-        root.f = heuristic(state, grid);
+        root.h = heuristic(state, grid);
+        root.f = (int32_t)((double)root.h * weight);
         root.blank = blank;
         root.parent = -1;
         root.move_dx = 0;
@@ -655,7 +674,8 @@ int mnsp_solve(const int32_t *positions, int grid,
                 memcpy(child.state, current_state, (size_t)cells * sizeof(int32_t));
                 swap_cells(child.state, current_blank, target);
                 child.g = current_g + 1;
-                child.f = child.g + heuristic(child.state, grid);
+                child.h = heuristic(child.state, grid);
+                child.f = child.g + (int32_t)((double)child.h * weight);
                 child.blank = target;
                 child.parent = index;
                 child.move_dx = DIR_X[dir];
@@ -687,4 +707,56 @@ done:
     }
     free(arena.items);
     return result;
+}
+
+int mnsp_solve(const int32_t *positions, int grid,
+               mnsp_move_t *out_moves, int capacity, uint64_t max_states)
+{
+    return solve_core(positions, grid, out_moves, capacity, max_states, 1.0);
+}
+
+int mnsp_solve_weighted(const int32_t *positions, int grid,
+                        mnsp_move_t *out_moves, int capacity, uint64_t max_states,
+                        double weight)
+{
+    return solve_core(positions, grid, out_moves, capacity, max_states, weight);
+}
+
+double mnsp_default_weight(int grid)
+{
+    /* Measured over 6-12 freshly shuffled boards per size (2026-11-04, see docs/109).
+     *
+     *   N   weight  outcome
+     *   3-4   1.0   exact A*, optimal, under 0.1 s
+     *   5     1.5   57-73 moves in 0.00-0.25 s (exact would be ~60, so near-optimal)
+     *   6     3.0   116-172 moves, 0.06 s average, 6/6 solved
+     *   7     4.0   229-307 moves, 5/6 solved
+     *   8     5.0   336-434 moves, 5/6 solved
+     *
+     * Beyond 6x6 exact search is hopeless (the reachable state count is 10^39 at 6x6
+     * and 10^87 at 8x8), so the bias is what makes these sizes tractable at all.
+     * Where a board still exceeds the budget the caller falls back to undo replay. */
+    if (grid <= 4) {
+        return 1.0;
+    }
+    if (grid == 5) {
+        return 1.5;
+    }
+    if (grid == 6) {
+        return 3.0;
+    }
+    if (grid == 7) {
+        return 4.0;
+    }
+    return 5.0;
+}
+
+uint64_t mnsp_default_budget(int grid)
+{
+    /* 8M keeps every size under about 12 s even in the worst case measured; smaller
+     * boards finish long before the cap. */
+    if (grid <= 4) {
+        return 4000000u;
+    }
+    return 8000000u;
 }

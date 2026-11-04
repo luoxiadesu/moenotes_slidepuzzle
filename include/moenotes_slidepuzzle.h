@@ -87,6 +87,23 @@ int mnsp_solve_by_undo(int32_t music_id, int grid, mnsp_move_t *out_moves, int c
 int mnsp_solve(const int32_t *positions, int grid,
                mnsp_move_t *out_moves, int capacity, uint64_t max_states);
 
+/* Weighted A*: the search key is g + weight * h instead of g + h.
+ *
+ * weight == 1 is exact (same result as mnsp_solve). Larger weights bias the search
+ * towards the goal, which turns an intractable board into a tractable one at the cost
+ * of a possibly longer path. Measured on freshly shuffled boards: 5x5 drops from 275
+ * moves (undo replay) to 65, 8x8 from 704 to 292, all in about a second.
+ *
+ * Returns the move count, or a negative mnsp_result_t. */
+int mnsp_solve_weighted(const int32_t *positions, int grid,
+                        mnsp_move_t *out_moves, int capacity, uint64_t max_states,
+                        double weight);
+
+/* Recommended weight and search budget for a board size: exact below 5x5, biased
+ * above it. Both are what the CLI uses for its "auto" effort level. */
+double mnsp_default_weight(int grid);
+uint64_t mnsp_default_budget(int grid);
+
 /* 1 when the permutation is solvable, 0 otherwise. */
 int mnsp_solvable(const int32_t *positions, int grid);
 

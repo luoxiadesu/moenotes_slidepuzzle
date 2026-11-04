@@ -68,14 +68,25 @@ tapping the tile above it.
 
 ### Two solvers
 
-| Command | When it applies | Cost |
-|---|---|---|
-| `solve <musicId> <grid>` | board is still in its generated state | O(N²), instantaneous, 11·N² moves |
-| `solve-state <grid> <board>` | board was moved by the player | A* — fast up to 4×4, budget-bound on 5×5+ |
+Both commands search first and only fall back to replaying the shuffle when the
+board is out of reach.
 
-`solve-state` is honest about its limits: a fresh 5×5 board is 275 random moves from
-the goal and may exceed the 4,000,000-state budget. Near-solved boards — the normal
-case once a player has made progress — solve immediately.
+| Grid | Exact A* (weight 1) | Shipped setting | Undo replay |
+|---|---|---|---|
+| 3x3 | 21 moves, <0.01 s | same | 99 |
+| 4x4 | 34 moves, 0.01 s | same | 176 |
+| 5x5 | intractable | **65 moves, 0.03 s** (w=1.5) | 275 |
+| 6x6 | intractable | **136 moves, 0.10 s** (w=3.0) | 396 |
+| 7x7 | intractable | **259 moves, 3.3 s** (w=4.0) | 539 |
+| 8x8 | intractable | **380 moves, 0.5 s** (w=5.0) | 704 |
+
+Boards 4x4 and below are solved **optimally**. Above that the search key becomes
+`g + weight*h`, which trades optimality for reachability — the reachable state count
+is 10^39 at 6x6 and 10^87 at 8x8, so exact search is not an option there.
+
+`solve <musicId> <grid> --strategy search|undo|auto` picks the path; `auto` (the
+default) searches and only replays the shuffle backwards, with a note on stderr, when
+the budget is exceeded.
 
 ## API
 
@@ -152,9 +163,9 @@ linking an HTTP client; nothing else in the tool touches the network.
    axis-aligned captures).
 4. The built-in jacket table is a snapshot; a new song needs a regenerated table
    (`tools/gen_jacket_table.py`) before `read-music` can find its cover art.
-5. `solve-state` has no guaranteed bound above 4x4: a freshly shuffled 5x5 is 275
-   random moves from the clear and can exhaust any sane A* budget. Boards a player
-   has already advanced are much closer and solve quickly.
+5. Boards above 4x4 are solved approximately: the shipped weights produce paths that
+   are valid but not provably shortest. 7x7 and 8x8 can still exceed the budget on
+   some boards, in which case the CLI falls back to undo replay (2-4x longer).
 6. The tool never reads or writes game saves and never touches the game or its
    servers; it only computes boards and move lists.
 

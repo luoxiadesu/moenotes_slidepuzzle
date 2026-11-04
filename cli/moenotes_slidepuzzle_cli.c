@@ -16,7 +16,9 @@ static void usage(FILE *out)
           "\n"
           "commands:\n"
           "  gen <musicId> <grid>        print the board the game builds, as tilePositions\n"
-          "  solve <musicId> <grid>      print the undo-the-shuffle solution (U/D/L/R)\n"
+          "  solve <musicId> <grid> [--strategy auto|search|undo]\n"
+          "                              solve the opening board; auto searches first and\n"
+          "                              only replays the shuffle when search is too slow\n"
           "  solve-state <grid> <p0,p1,...>\n"
           "                              solve an arbitrary board\n"
           "  read <screenshot> <jacket> <grid> [--solve]\n"
@@ -122,20 +124,51 @@ static int command_solve(int argc, char **argv)
     long music_id;
     long grid;
     int32_t positions[64];
-    mnsp_move_t moves[1408];
+    mnsp_move_t moves[4096];
     int count;
+    const char *strategy = "auto";
 
     if (argc < 4 || !parse_int(argv[2], &music_id) || !parse_int(argv[3], &grid)) {
         return 2;
     }
+    for (int i = 4; i < argc; i++) {
+        if (strcmp(argv[i], "--strategy") == 0 && i + 1 < argc) {
+            strategy = argv[++i];
+        } else {
+            return 2;
+        }
+    }
     if (mnsp_generate((int32_t)music_id, (int)grid, positions) != MNSP_OK) {
         return fail("unsupported grid");
     }
-    count = mnsp_solve_by_undo((int32_t)music_id, (int)grid, moves, 1408);
+
+    /* auto: search first (much shorter paths), fall back to replaying the shuffle
+     * backwards when the board is too far for the budget. */
+    if (strcmp(strategy, "undo") != 0) {
+        count = mnsp_solve_weighted(positions, (int)grid, moves, 4096,
+                                    mnsp_default_budget((int)grid),
+                                    mnsp_default_weight((int)grid));
+        if (count >= 0) {
+            printf("musicId=%ld grid=%ld moves=%d strategy=search\n", music_id, grid, count);
+            for (int i = 0; i < count; i++) {
+                putchar(move_letter(moves[i]));
+            }
+            putchar('\n');
+            return 0;
+        }
+        if (strcmp(strategy, "search") == 0) {
+            return fail(mnsp_result_string((mnsp_result_t)(-count)));
+        }
+        fprintf(stderr,
+                "note: search hit its budget on this board; falling back to replaying\n"
+                "      the shuffle backwards, which is valid but roughly 2-4x longer.\n");
+    }
+
+    count = mnsp_solve_by_undo((int32_t)music_id, (int)grid, moves, 4096);
     if (count < 0) {
         return fail(mnsp_result_string((mnsp_result_t)(-count)));
     }
-    printf("musicId=%ld grid=%ld moves=%d\n", music_id, grid, count);
+    printf("musicId=%ld grid=%ld moves=%d strategy=undo\n", music_id, grid, count);
     for (int i = 0; i < count; i++) {
         putchar(move_letter(moves[i]));
     }
@@ -181,7 +214,9 @@ static int command_solve_state(int argc, char **argv)
     }
     printf("grid=%ld solvable=yes\n", grid);
     print_board_view(positions, (int)grid);
-    count = mnsp_solve(positions, (int)grid, moves, 4096, 4000000);
+    count = mnsp_solve_weighted(positions, (int)grid, moves, 4096,
+                                mnsp_default_budget((int)grid),
+                                mnsp_default_weight((int)grid));
     if (count == -MNSP_ERR_SEARCH_LIMIT) {
         return fail("search limit reached; the board is too far from a solved state");
     }

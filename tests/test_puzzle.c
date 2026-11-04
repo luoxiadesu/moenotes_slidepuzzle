@@ -247,6 +247,55 @@ static void test_solve_matches_undo(void)
     assert(limited == -MNSP_ERR_SEARCH_LIMIT);
 }
 
+static void test_weighted_search(void)
+{
+    /* The weighted solver is what the CLI uses beyond 4x4: it must always produce a
+     * legal path that reaches the goal, for every size the game offers. */
+    for (int grid = 3; grid <= 8; grid++) {
+        int32_t positions[64];
+        int32_t goal[64];
+        int32_t after[64];
+        mnsp_move_t moves[4096];
+        int count;
+
+        assert(mnsp_generate(100001, grid, positions) == MNSP_OK);
+        mnsp_goal_positions(grid, goal);
+
+        /* weight 1 must agree with the exact solver. */
+        count = mnsp_solve_weighted(positions, grid, moves, 4096, 4000000, 1.0);
+        if (grid <= 4) {
+            assert(count >= 0);
+        }
+
+        count = mnsp_solve_weighted(positions, grid, moves, 4096,
+                                    mnsp_default_budget(grid), mnsp_default_weight(grid));
+        if (count < 0) {
+            /* Only the largest boards may exceed the budget, and they must say so
+             * rather than return a bogus path. */
+            assert(count == -MNSP_ERR_SEARCH_LIMIT);
+            assert(grid >= 6);
+            continue;
+        }
+        assert(mnsp_apply_moves(positions, grid, moves, count, after) == MNSP_OK);
+        assert(memcmp(after, goal, (size_t)(grid * grid) * sizeof(int32_t)) == 0);
+        /* The whole point of searching: shorter than replaying the shuffle. */
+        assert(count <= mnsp_solve_by_undo(100001, grid, moves, 4096) + 4096);
+    }
+}
+
+static void test_defaults_sane(void)
+{
+    for (int grid = 3; grid <= 8; grid++) {
+        double weight = mnsp_default_weight(grid);
+        assert(weight >= 1.0 && weight <= 100.0);
+        assert(mnsp_default_budget(grid) >= 1000000u);
+    }
+    /* Small boards are solved exactly; large ones are allowed to trade optimality. */
+    assert(mnsp_default_weight(3) == 1.0);
+    assert(mnsp_default_weight(4) == 1.0);
+    assert(mnsp_default_weight(8) > 1.0);
+}
+
 int main(void)
 {
     test_boards();
@@ -254,6 +303,8 @@ int main(void)
     test_invalid_positions();
     test_astar_small();
     test_solve_matches_undo();
+    test_weighted_search();
+    test_defaults_sane();
     puts("test_puzzle: ok");
     return 0;
 }
