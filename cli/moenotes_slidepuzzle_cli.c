@@ -16,9 +16,11 @@ static void usage(FILE *out)
           "\n"
           "commands:\n"
           "  gen <musicId> <grid>        print the board the game builds, as tilePositions\n"
-          "  solve <musicId> <grid> [--strategy auto|search|undo]\n"
+          "  solve <musicId> <grid> [--strategy auto|search|undo] [--max-states N]\n"
           "                              solve the opening board; auto searches first and\n"
-          "                              only replays the shuffle when search is too slow\n"
+          "                              only replays the shuffle when search is too slow.\n"
+          "                              --max-states caps distinct boards explored (default\n"
+          "                              depends on size); lower it to bound peak memory\n"
           "  solve-state <grid> <p0,p1,...>\n"
           "                              solve an arbitrary board\n"
           "  read <screenshot> <jacket> <grid> [--solve]\n"
@@ -51,6 +53,21 @@ static int parse_int(const char *text, long *out)
         return 0;
     }
     value = strtol(text, &end, 10);
+    if (end == text || *end != '\0') {
+        return 0;
+    }
+    *out = value;
+    return 1;
+}
+
+static int parse_ll(const char *text, long long *out)
+{
+    char *end = NULL;
+    long long value;
+    if (text == NULL || *text == '\0') {
+        return 0;
+    }
+    value = strtoll(text, &end, 10);
     if (end == text || *end != '\0') {
         return 0;
     }
@@ -127,6 +144,7 @@ static int command_solve(int argc, char **argv)
     mnsp_move_t moves[4096];
     int count;
     const char *strategy = "auto";
+    uint64_t budget = 0;
 
     if (argc < 4 || !parse_int(argv[2], &music_id) || !parse_int(argv[3], &grid)) {
         return 2;
@@ -134,6 +152,12 @@ static int command_solve(int argc, char **argv)
     for (int i = 4; i < argc; i++) {
         if (strcmp(argv[i], "--strategy") == 0 && i + 1 < argc) {
             strategy = argv[++i];
+        } else if (strcmp(argv[i], "--max-states") == 0 && i + 1 < argc) {
+            long long parsed;
+            if (!parse_ll(argv[++i], &parsed) || parsed <= 0) {
+                return 2;
+            }
+            budget = (uint64_t)parsed;
         } else {
             return 2;
         }
@@ -141,12 +165,14 @@ static int command_solve(int argc, char **argv)
     if (mnsp_generate((int32_t)music_id, (int)grid, positions) != MNSP_OK) {
         return fail("unsupported grid");
     }
+    if (budget == 0) {
+        budget = mnsp_default_budget((int)grid);
+    }
 
     /* auto: search first (much shorter paths), fall back to replaying the shuffle
      * backwards when the board is too far for the budget. */
     if (strcmp(strategy, "undo") != 0) {
-        count = mnsp_solve_best(positions, (int)grid, moves, 4096,
-                                mnsp_default_budget((int)grid));
+        count = mnsp_solve_best(positions, (int)grid, moves, 4096, budget);
         if (count >= 0) {
             printf("musicId=%ld grid=%ld moves=%d strategy=search\n", music_id, grid, count);
             for (int i = 0; i < count; i++) {

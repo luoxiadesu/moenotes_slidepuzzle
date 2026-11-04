@@ -791,11 +791,12 @@ static int solve_core(const int32_t *positions, int grid,
                     continue;
                 }
                 target = ny * grid + nx;
-                /* Generate the child's board into a stack scratch buffer first: it is
-                 * needed to compute the key, and the key decides whether the child is
-                 * worth allocating at all. */
+                /* Generate the child's board into a stack scratch buffer first: the key
+                 * decides whether it is worth allocating, and the heuristic decides
+                 * whether it is worth exploring at all. */
                 {
                     int8_t probe[64];
+                    int32_t child_h;
                     memcpy(probe, current_state, (size_t)cells);
                     {
                         int8_t tmp = probe[current_blank];
@@ -806,6 +807,16 @@ static int solve_core(const int32_t *positions, int grid,
                     if (seen_find(&closed, child_key, &stored) && stored <= current_g + 1) {
                         continue;
                     }
+                    /* Bounded refinement, applied *here* rather than only at pop time.
+                     * Pruning at pop alone does not save anything: the child is already
+                     * claimed in the seen set and allocated before it reaches the pop,
+                     * so the search still walks the full budget. With an admissible h,
+                     * g+h >= upper_bound means no path through this child can beat the
+                     * incumbent. */
+                    child_h = heuristic(probe, &hctx);
+                    if (upper_bound > 0 && current_g + 1 + child_h >= upper_bound) {
+                        continue;
+                    }
                     /* Claim the key now rather than at expansion time. Every state is
                      * therefore enqueued at most once per strictly better g, which is
                      * what keeps the arena close to the number of distinct boards. */
@@ -813,20 +824,15 @@ static int solve_core(const int32_t *positions, int grid,
                         result = -MNSP_ERR_OUT_OF_MEMORY;
                         goto done;
                     }
+                    child.state = (int8_t *)malloc((size_t)cells);
+                    if (child.state == NULL) {
+                        result = -MNSP_ERR_OUT_OF_MEMORY;
+                        goto done;
+                    }
+                    memcpy(child.state, probe, (size_t)cells);
+                    child.g = current_g + 1;
+                    child.h = child_h;
                 }
-                child.state = (int8_t *)malloc((size_t)cells);
-                if (child.state == NULL) {
-                    result = -MNSP_ERR_OUT_OF_MEMORY;
-                    goto done;
-                }
-                memcpy(child.state, current_state, (size_t)cells);
-                {
-                    int8_t tmp = child.state[current_blank];
-                    child.state[current_blank] = child.state[target];
-                    child.state[target] = tmp;
-                }
-                child.g = current_g + 1;
-                child.h = heuristic(child.state, &hctx);
                 child.f = child.g + (int32_t)((double)child.h * weight);
                 child.blank = target;
                 child.parent = index;
@@ -905,15 +911,41 @@ int mnsp_solve_weighted(const int32_t *positions, int grid,
 int mnsp_solve_best(const int32_t *positions, int grid,
                     mnsp_move_t *out_moves, int capacity, uint64_t max_states)
 {
-    /* Round 0 is the safety net: it must nearly always succeed, because a round that
-     * exhausts its cap still costs the full cap. 7x7 is the size where this bites —
-     * one board there needs 15 s at w=5 but 0.1 s at w=6, so the ladder cannot start
-     * lower just to gain a few moves. 6x6 is forgiving and starts at 3.0.
-     * Measured over 12 boards per size (2026-11-05). */
-    static const double LADDER_5[] = { 2.0, 1.5 };
-    static const double LADDER_6[] = { 3.0, 2.5 };
-    static const double LADDER_7[] = { 6.0, 4.0 };
-    static const double LADDER_8[] = { 8.0, 5.0 };
+    /* Round 0 is the safety net: it must finish, and it must finish *cheaply*, because
+     * a round that exhausts its cap costs the full cap. That rules out starting at a
+     * mild bias hoping to save a few moves — on this game's boards the mild bias is
+     * the slow one. Concrete measurements on single boards, all of which the ladder
+     * has to survive:
+     *
+     *   5x5 100010:  w=1.5 -> 8.6 s exhausted    w=2.0 -> 0.60 s, 95 moves
+     *   6x6 100006:  w=3.0 -> 8.1 s (5.7M states) w=4.0 -> 0.04 s, 140 moves
+     *   7x7 100066:  w=5.0 -> 15 s, 305 moves     w=6.0 -> 0.12 s, 289 moves
+     *
+     * So each ladder starts high and only descends one step. The second entry is the
+     * refinement: with the incumbent bound pruning it at generation time, it either
+     * shortens the path cheaply or returns in a fraction of the first round. */
+    static const double LADDER_5[] = { 2.5, 2.0 };
+    static const double LADDER_6[] = { 4.5, 3.5 };
+    /* One entry: refinement rounds did not pay for themselves at this size. Dropping
+     * 7x7 from 6.0 to 4.0 on board 100066 re-explored for 26 s and returned a *longer*
+     * path (305 vs 289). */
+    static const double LADDER_7[] = { 6.0 };
+    /* 8x8 needs *two* mutually exclusive biases, and this is the only size where that
+     * was proven necessary rather than merely convenient. Over all 84 songs no single
+     * weight covers the set:
+     *
+     *   w=10            78/84
+     *   w=14            83/84  (fails 100404)
+     *   w=16            83/84  (fails 100404)
+     *
+     * and the boards that break are opposite: 100404 solves instantly at w=8 and fails
+     * at every w >= 10, while 100021 fails at w <= 10 and needs w >= 12. Path length is
+     * not monotone in the weight, so neither direction is "safer".
+     *
+     * {8, 14} covers all 84 (average 408 moves); adding 6.0 as a third round improves
+     * that to 379 moves but costs another full-budget round on every board the first
+     * two miss, which roughly doubles the sweep time. The pair is the shipped choice. */
+    static const double LADDER_8[] = { 8.0, 14.0 };
     const double *weights;
     int rounds;
     int best = -1;
