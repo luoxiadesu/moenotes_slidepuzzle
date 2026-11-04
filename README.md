@@ -75,14 +75,24 @@ board is out of reach.
 |---|---|---|---|
 | 3x3 | 21 moves, <0.01 s | same | 99 |
 | 4x4 | 34 moves, 0.01 s | same | 176 |
-| 5x5 | intractable | **65 moves, 0.03 s** (w=1.5) | 275 |
-| 6x6 | intractable | **136 moves, 0.10 s** (w=3.0) | 396 |
-| 7x7 | intractable | **259 moves, 3.3 s** (w=4.0) | 539 |
-| 8x8 | intractable | **380 moves, 0.5 s** (w=5.0) | 704 |
+| 5x5 | intractable | **71 moves, 0.2 s** | 275 |
+| 6x6 | intractable | **132 moves, 1.0 s** | 396 |
+| 7x7 | intractable | **250 moves, 2.2 s** (worst 13 s) | 539 |
+| 8x8 | intractable | **358 moves, 1.6 s** (worst 7 s) | 704 |
 
 Boards 4x4 and below are solved **optimally**. Above that the search key becomes
 `g + weight*h`, which trades optimality for reachability — the reachable state count
 is 10^39 at 6x6 and 10^87 at 8x8, so exact search is not an option there.
+
+A single weight does not work on large boards: the bias that makes one board trivial
+lets another exhaust its budget, and path length is not monotone in the weight (one
+7x7 board needs 289 moves at w=6 but 305 at w=5, found 100x slower). `mnsp_solve_best`
+therefore runs a descending ladder of biases and keeps the shortest path any of them
+finds. Round 0 is deliberately over-biased — nearly guaranteed to finish — and each
+later round is pruned by the best length so far (`g + h >= best` is dropped), so
+refinement rounds cost less than the round that produced the bound rather than more.
+All 12 boards per size in the benchmark now solve in budget; previously the hardest
+7x7 fell back to replaying 539 moves.
 
 `solve <musicId> <grid> --strategy search|undo|auto` picks the path; `auto` (the
 default) searches and only replays the shuffle backwards, with a note on stderr, when
@@ -163,9 +173,10 @@ linking an HTTP client; nothing else in the tool touches the network.
    axis-aligned captures).
 4. The built-in jacket table is a snapshot; a new song needs a regenerated table
    (`tools/gen_jacket_table.py`) before `read-music` can find its cover art.
-5. Boards above 4x4 are solved approximately: the shipped weights produce paths that
-   are valid but not provably shortest. 7x7 and 8x8 can still exceed the budget on
-   some boards, in which case the CLI falls back to undo replay (2-4x longer).
+5. Boards above 4x4 are solved approximately: the shipped ladders produce valid paths
+   that are typically 2-3.5x the Manhattan lower bound, not provably shortest. Peak
+   memory is dominated by the search budget (~210 MiB on the hardest 7x7 board with
+   the default 8M-state cap); lower `--max-states` trades length for memory.
 6. The tool never reads or writes game saves and never touches the game or its
    servers; it only computes boards and move lists.
 

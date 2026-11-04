@@ -114,8 +114,10 @@ void sp_tiles_free(sp_tile_set_t *set)
     }
     free(set->mosaic);
     free(set->flat);
+    free(set->tile_variance);
     set->mosaic = NULL;
     set->flat = NULL;
+    set->tile_variance = NULL;
     set->grid = 0;
     set->count = 0;
 }

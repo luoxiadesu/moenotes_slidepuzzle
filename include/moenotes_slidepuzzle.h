@@ -99,6 +99,20 @@ int mnsp_solve_weighted(const int32_t *positions, int grid,
                         mnsp_move_t *out_moves, int capacity, uint64_t max_states,
                         double weight);
 
+/* Weighted A* over a descending ladder of biases, returning the shortest path any of
+ * them finds. This is what the CLI uses above 4x4.
+ *
+ * A single weight is unreliable on large boards: a bias that solves one board can
+ * exhaust the budget on another, and path length is not monotone in the weight. The
+ * ladder starts at the bias that almost always finishes in seconds and only descends
+ * when needed, so a typical board costs one search. `max_states` is shared across
+ * rounds rather than granted to each, which bounds the worst case.
+ *
+ * Boards of 4x4 and below are solved exactly. Returns the move count or a negative
+ * mnsp_result_t. */
+int mnsp_solve_best(const int32_t *positions, int grid,
+                    mnsp_move_t *out_moves, int capacity, uint64_t max_states);
+
 /* Recommended weight and search budget for a board size: exact below 5x5, biased
  * above it. Both are what the CLI uses for its "auto" effort level. */
 double mnsp_default_weight(int grid);

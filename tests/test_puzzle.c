@@ -261,9 +261,18 @@ static void test_weighted_search(void)
         assert(mnsp_generate(100001, grid, positions) == MNSP_OK);
         mnsp_goal_positions(grid, goal);
 
-        /* weight 1 must agree with the exact solver. */
-        count = mnsp_solve_weighted(positions, grid, moves, 4096, 4000000, 1.0);
+        /* weight 1 must agree with the exact solver, but only 3x3/4x4 are small
+         * enough for exact search on a freshly shuffled board. Above that the exact
+         * search cannot finish in any budget, so it is not attempted here. */
         if (grid <= 4) {
+            count = mnsp_solve_weighted(positions, grid, moves, 4096, 4000000, 1.0);
+            assert(count >= 0);
+            {
+                int32_t check[64];
+                assert(mnsp_apply_moves(positions, grid, moves, count, check) == MNSP_OK);
+                assert(memcmp(check, goal, (size_t)(grid * grid) * sizeof(int32_t)) == 0);
+            }
+            count = mnsp_solve(positions, grid, moves, 4096, 4000000);
             assert(count >= 0);
         }
 
@@ -296,6 +305,70 @@ static void test_defaults_sane(void)
     assert(mnsp_default_weight(8) > 1.0);
 }
 
+static void test_solve_best(void)
+{
+    /* mnsp_solve_best is what the CLI uses above 4x4. It must (a) stay exact on the
+     * small boards, (b) return a legal path on the large ones, and (c) never be worse
+     * than a single fixed-weight search on the size it is tuned for. */
+    for (int grid = 3; grid <= 8; grid++) {
+        int32_t positions[64];
+        int32_t goal[64];
+        int32_t after[64];
+        mnsp_move_t moves[4096];
+        int count;
+
+        assert(mnsp_generate(100001, grid, positions) == MNSP_OK);
+        mnsp_goal_positions(grid, goal);
+
+        count = mnsp_solve_best(positions, grid, moves, 4096, mnsp_default_budget(grid));
+        assert(count >= 0);
+        assert(mnsp_apply_moves(positions, grid, moves, count, after) == MNSP_OK);
+        assert(memcmp(after, goal, (size_t)(grid * grid) * sizeof(int32_t)) == 0);
+
+        if (grid <= 4) {
+            int exact = mnsp_solve(positions, grid, moves, 4096, 4000000);
+            assert(exact >= 0);
+            assert(count == exact); /* still optimal below 5x5 */
+        } else {
+            /* Better than replaying the shuffle, which is the fallback. */
+            assert(count < mnsp_solve_by_undo(100001, grid, moves, 4096));
+        }
+    }
+
+    /* The ladder must also handle a board reached mid-game, not just a fresh shuffle:
+     * solve a board, apply part of the path, then solve the intermediate state. */
+    {
+        int32_t positions[64];
+        int32_t mid[64];
+        int32_t goal[64];
+        int32_t after[64];
+        mnsp_move_t moves[4096];
+        int count;
+        int partial;
+
+        assert(mnsp_generate(100007, 5, positions) == MNSP_OK);
+        mnsp_goal_positions(5, goal);
+        count = mnsp_solve_best(positions, 5, moves, 4096, mnsp_default_budget(5));
+        assert(count > 20);
+        partial = count / 2;
+        assert(mnsp_apply_moves(positions, 5, moves, partial, mid) == MNSP_OK);
+        count = mnsp_solve_best(mid, 5, moves, 4096, mnsp_default_budget(5));
+        assert(count >= 0);
+        assert(mnsp_apply_moves(mid, 5, moves, count, after) == MNSP_OK);
+        assert(memcmp(after, goal, (size_t)25 * sizeof(int32_t)) == 0);
+    }
+
+    /* A trivially small budget must be reported, not silently ignored or looped on. */
+    {
+        int32_t positions[64];
+        mnsp_move_t moves[4096];
+        int count;
+        assert(mnsp_generate(100001, 8, positions) == MNSP_OK);
+        count = mnsp_solve_best(positions, 8, moves, 4096, 1000);
+        assert(count == -MNSP_ERR_SEARCH_LIMIT);
+    }
+}
+
 int main(void)
 {
     test_boards();
@@ -305,6 +378,7 @@ int main(void)
     test_solve_matches_undo();
     test_weighted_search();
     test_defaults_sane();
+    test_solve_best();
     puts("test_puzzle: ok");
     return 0;
 }

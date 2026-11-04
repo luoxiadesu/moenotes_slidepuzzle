@@ -145,9 +145,8 @@ static int command_solve(int argc, char **argv)
     /* auto: search first (much shorter paths), fall back to replaying the shuffle
      * backwards when the board is too far for the budget. */
     if (strcmp(strategy, "undo") != 0) {
-        count = mnsp_solve_weighted(positions, (int)grid, moves, 4096,
-                                    mnsp_default_budget((int)grid),
-                                    mnsp_default_weight((int)grid));
+        count = mnsp_solve_best(positions, (int)grid, moves, 4096,
+                                mnsp_default_budget((int)grid));
         if (count >= 0) {
             printf("musicId=%ld grid=%ld moves=%d strategy=search\n", music_id, grid, count);
             for (int i = 0; i < count; i++) {
@@ -214,9 +213,8 @@ static int command_solve_state(int argc, char **argv)
     }
     printf("grid=%ld solvable=yes\n", grid);
     print_board_view(positions, (int)grid);
-    count = mnsp_solve_weighted(positions, (int)grid, moves, 4096,
-                                mnsp_default_budget((int)grid),
-                                mnsp_default_weight((int)grid));
+    count = mnsp_solve_best(positions, (int)grid, moves, 4096,
+                            mnsp_default_budget((int)grid));
     if (count == -MNSP_ERR_SEARCH_LIMIT) {
         return fail("search limit reached; the board is too far from a solved state");
     }

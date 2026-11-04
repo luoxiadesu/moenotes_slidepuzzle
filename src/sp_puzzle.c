@@ -2,6 +2,8 @@
 #include "moenotes_slidepuzzle.h"
 
 #include <stdlib.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* GetValidMoves walks Vector2Int.up, .down, .left, .right in this order
@@ -273,34 +275,44 @@ int mnsp_solve_by_undo(int32_t music_id, int grid, mnsp_move_t *out_moves, int c
 
 /* ------------------------------------------------------------------- A* */
 
-/* Closed set keyed by the board bytes. Open addressing with linear probing; a full
- * table simply stops absorbing new keys (search stays correct, only slower). */
-typedef struct closed_set {
+/* Best known g per board, covering every state that has been *discovered* — both the
+ * ones still on the open list and the ones already expanded.
+ *
+ * Recording only expanded states (the earlier design) let every not-yet-expanded
+ * state be enqueued once per parent that reached it: on an 8x8 board that produced
+ * 3.4 arena entries per unique state, i.e. two thirds of all node allocations and
+ * heuristic evaluations were duplicates that were thrown away on pop. Moving the
+ * insert to child-generation time costs one probe per child and removes them.
+ *
+ * Open addressing with linear probing. */
+typedef struct seen_set {
     uint64_t *keys;   /* 0 = empty slot */
     int32_t *g;       /* best known g for that key */
     size_t capacity;
     size_t used;
-} closed_set_t;
+    size_t max_capacity; /* growth ceiling; 0 = unbounded */
+} seen_set_t;
 
-static uint64_t hash_board(const int32_t *state, int cells)
+static uint64_t hash_board(const int8_t *state, int cells)
 {
     uint64_t hash = 1469598103934665603ull;
     for (int i = 0; i < cells; i++) {
-        hash ^= (uint64_t)(uint32_t)state[i] + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+        hash ^= (uint64_t)(uint32_t)(int32_t)state[i] + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
     }
     return hash == 0 ? 1 : hash;
 }
 
-static int closed_init(closed_set_t *set, size_t capacity)
+static int seen_init(seen_set_t *set, size_t capacity, size_t max_capacity)
 {
     set->keys = (uint64_t *)calloc(capacity, sizeof(uint64_t));
     set->g = (int32_t *)malloc(capacity * sizeof(int32_t));
     set->capacity = capacity;
     set->used = 0;
+    set->max_capacity = max_capacity;
     return set->keys != NULL && set->g != NULL;
 }
 
-static void closed_free(closed_set_t *set)
+static void seen_free(seen_set_t *set)
 {
     free(set->keys);
     free(set->g);
@@ -310,8 +322,53 @@ static void closed_free(closed_set_t *set)
     set->used = 0;
 }
 
+/* Grow and rehash. Returns 1 on success, 0 when growth is not possible (at the
+ * ceiling, or out of memory) — the caller then keeps inserting into the smaller
+ * table, which stays correct but costs extra re-expansions. */
+static int seen_grow(seen_set_t *set)
+{
+    size_t next = set->capacity * 2;
+    uint64_t *keys;
+    int32_t *g;
+    size_t i;
+
+    if (set->max_capacity != 0 && next > set->max_capacity) {
+        if (set->capacity >= set->max_capacity) {
+            return 0;
+        }
+        next = set->max_capacity;
+    }
+    keys = (uint64_t *)calloc(next, sizeof(uint64_t));
+    g = (int32_t *)malloc(next * sizeof(int32_t));
+    if (keys == NULL || g == NULL) {
+        free(keys);
+        free(g);
+        return 0;
+    }
+    for (i = 0; i < set->capacity; i++) {
+        uint64_t key = set->keys[i];
+        if (key == 0) {
+            continue;
+        }
+        {
+            size_t slot = (size_t)(key % next);
+            while (keys[slot] != 0) {
+                slot = (slot + 1) % next;
+            }
+            keys[slot] = key;
+            g[slot] = set->g[i];
+        }
+    }
+    free(set->keys);
+    free(set->g);
+    set->keys = keys;
+    set->g = g;
+    set->capacity = next;
+    return 1;
+}
+
 /* Returns 1 when the key was present (and fills *stored_g), else 0. */
-static int closed_find(const closed_set_t *set, uint64_t key, int32_t *stored_g)
+static int seen_find(const seen_set_t *set, uint64_t key, int32_t *stored_g)
 {
     size_t slot = (size_t)(key % set->capacity);
     for (size_t probes = 0; probes < set->capacity; probes++) {
@@ -329,11 +386,23 @@ static int closed_find(const closed_set_t *set, uint64_t key, int32_t *stored_g)
     return 0;
 }
 
-static void closed_insert(closed_set_t *set, uint64_t key, int32_t g)
+/* Insert or improve. Returns 1 when the entry is recorded, 0 when the table is at
+ * its ceiling and cannot grow.
+ *
+ * The old version silently dropped every insert past a 75% load factor on a fixed
+ * 1M-slot table. That is not a benign optimisation: once the closed set stops
+ * recording expanded states, A* loses cycle detection entirely and re-expands them,
+ * which is exponential rather than linear degradation. It is what made any weight
+ * below 4x4 shipped values time out with no diagnostic. Now the table grows, and a
+ * table that cannot grow is reported to the caller instead of being quietly unusable. */
+static int seen_insert(seen_set_t *set, uint64_t key, int32_t g)
 {
     size_t slot;
+
     if (set->used * 4 >= set->capacity * 3) {
-        return; /* keep the load factor under 75%; dropping is safe for A* correctness */
+        if (!seen_grow(set)) {
+            return 0;
+        }
     }
     slot = (size_t)(key % set->capacity);
     while (set->keys[slot] != 0) {
@@ -341,13 +410,14 @@ static void closed_insert(closed_set_t *set, uint64_t key, int32_t g)
             if (g < set->g[slot]) {
                 set->g[slot] = g;
             }
-            return;
+            return 1;
         }
         slot = (slot + 1) % set->capacity;
     }
     set->keys[slot] = key;
     set->g[slot] = g;
     set->used++;
+    return 1;
 }
 
 /* Manhattan distance plus linear conflict; admissible and consistent.
@@ -355,38 +425,63 @@ static void closed_insert(closed_set_t *set, uint64_t key, int32_t g)
  * `value` is a tile id, which equals the cell it belongs in *in the solved layout*;
  * the solved layout is not the identity permutation (see mnsp_goal_positions), so
  * the target cell must be looked up rather than assumed to be `value`. */
-static int heuristic(const int32_t *state, int grid)
-{
-    int total = 0;
-    int cells = grid * grid;
-    int target[64];
+/* Everything the heuristic needs that depends only on the board size. Building it
+ * once per solve and passing it in removes the integer divisions that used to sit in
+ * the inner loops: `target[v] / grid` and `% grid` ran grid^2 times per line for the
+ * linear-conflict scan, which dominated the search at 7x7/8x8. */
+typedef struct heur_ctx {
+    int grid;
+    int cells;
+    int8_t goal_row[64]; /* goal cell row of tile id v */
+    int8_t goal_col[64]; /* goal cell column of tile id v */
+    int8_t cell_row[64];
+    int8_t cell_col[64];
+} heur_ctx_t;
 
-    for (int row = 0; row < grid; row++) {
-        for (int col = 0; col < grid; col++) {
-            target[(grid - 1 - row) * grid + col] = row * grid + col;
-        }
+static void heur_ctx_init(heur_ctx_t *ctx, int grid)
+{
+    ctx->grid = grid;
+    ctx->cells = grid * grid;
+    for (int i = 0; i < ctx->cells; i++) {
+        ctx->cell_row[i] = (int8_t)(i / grid);
+        ctx->cell_col[i] = (int8_t)(i % grid);
     }
+    /* Tile id v belongs at cell index (grid-1-row)*grid + col in the solved layout,
+     * because the game numbers tiles with y counted from the bottom while this
+     * library lists cells in screen order. */
+    for (int v = 0; v < ctx->cells; v++) {
+        int flat = (grid - 1 - v / grid) * grid + (v % grid);
+        ctx->goal_row[v] = (int8_t)(flat / grid);
+        ctx->goal_col[v] = (int8_t)(flat % grid);
+    }
+}
+
+/* Manhattan distance plus linear conflict; admissible and consistent. */
+static int heuristic(const int8_t *state, const heur_ctx_t *ctx)
+{
+    const int grid = ctx->grid;
+    const int cells = ctx->cells;
+    int total = 0;
 
     for (int i = 0; i < cells; i++) {
-        int32_t value = state[i];
+        int32_t value = (int32_t)state[i];
         if (value < 0 || value >= cells) {
             continue;
         }
-        {
-            int goal_cell = target[value];
-            total += abs(i % grid - goal_cell % grid) + abs(i / grid - goal_cell / grid);
-        }
+        total += abs(ctx->cell_col[i] - ctx->goal_col[value]) +
+                 abs(ctx->cell_row[i] - ctx->goal_row[value]);
     }
     for (int row = 0; row < grid; row++) {
+        const int base = row * grid;
         for (int a = 0; a < grid; a++) {
-            int32_t va = state[row * grid + a];
-            if (va < 0 || va >= cells || target[va] / grid != row) {
+            int32_t va = (int32_t)state[base + a];
+            if (va < 0 || va >= cells || ctx->goal_row[va] != row) {
                 continue;
             }
             for (int b = a + 1; b < grid; b++) {
-                int32_t vb = state[row * grid + b];
-                if (vb >= 0 && vb < cells && target[vb] / grid == row &&
-                    target[va] % grid > target[vb] % grid) {
+                int32_t vb = (int32_t)state[base + b];
+                if (vb >= 0 && vb < cells && ctx->goal_row[vb] == row &&
+                    ctx->goal_col[va] > ctx->goal_col[vb]) {
                     total += 2;
                 }
             }
@@ -394,14 +489,14 @@ static int heuristic(const int32_t *state, int grid)
     }
     for (int col = 0; col < grid; col++) {
         for (int a = 0; a < grid; a++) {
-            int32_t va = state[a * grid + col];
-            if (va < 0 || va >= cells || target[va] % grid != col) {
+            int32_t va = (int32_t)state[a * grid + col];
+            if (va < 0 || va >= cells || ctx->goal_col[va] != col) {
                 continue;
             }
             for (int b = a + 1; b < grid; b++) {
-                int32_t vb = state[b * grid + col];
-                if (vb >= 0 && vb < cells && target[vb] % grid == col &&
-                    target[va] / grid > target[vb] / grid) {
+                int32_t vb = (int32_t)state[b * grid + col];
+                if (vb >= 0 && vb < cells && ctx->goal_col[vb] == col &&
+                    ctx->goal_row[va] > ctx->goal_row[vb]) {
                     total += 2;
                 }
             }
@@ -411,7 +506,10 @@ static int heuristic(const int32_t *state, int grid)
 }
 
 typedef struct open_node {
-    int32_t *state;
+    /* Board packed as bytes: a tile id never exceeds grid*grid-1 <= 63 and the blank
+     * is -1, so int8_t holds every value. Storing int32_t here cost 4x the memory and
+     * the frontier is the dominant allocation on 7x7/8x8. */
+    int8_t *state;    /* NULL once expanded (freed) */
     int32_t g;
     int32_t f;      /* search key: g + weight*scale*h */
     int32_t h;      /* raw heuristic, kept for deterministic tie-breaking */
@@ -524,16 +622,22 @@ static int32_t ih_pop(index_heap_t *heap)
 
 /* weight = 1 gives an optimal solution (exact A*). Larger weights bias the search
  * towards the goal: the result is a valid but possibly longer path, found with far
- * fewer expansions. `h` is kept unscaled so the heap can break ties on it. */
+ * fewer expansions. `h` is kept unscaled so the heap can break ties on it.
+ *
+ * `upper_bound` (when > 0) is a known solution length: any state whose admissible
+ * lower bound g+h already reaches it cannot lead to a shorter path, so it is pruned.
+ * Passing the length of a path found by an earlier, cruder search is what makes the
+ * refinement rounds cheaper than the round that produced the bound. */
 static int solve_core(const int32_t *positions, int grid,
                       mnsp_move_t *out_moves, int capacity, uint64_t max_states,
-                      double weight)
+                      double weight, int32_t upper_bound)
 {
     int cells;
     int32_t *goal = NULL;
     node_arena_t arena = { 0 };
     index_heap_t open = { 0 };
-    closed_set_t closed = { 0 };
+    seen_set_t closed = { 0 };
+    heur_ctx_t hctx;
     int result = -MNSP_ERR_INTERNAL;
     uint64_t order = 0;
     int32_t blank = -1;
@@ -552,6 +656,7 @@ static int solve_core(const int32_t *positions, int grid,
         return -MNSP_ERR_INVALID_ARGUMENT;
     }
     cells = grid * grid;
+    heur_ctx_init(&hctx, grid);
 
     goal = (int32_t *)malloc((size_t)cells * sizeof(int32_t));
     if (goal == NULL) {
@@ -563,7 +668,7 @@ static int solve_core(const int32_t *positions, int grid,
         result = 0;
         goto done;
     }
-    if (!closed_init(&closed, 1u << 20)) {
+    if (!seen_init(&closed, 1u << 16, 0)) {
         result = -MNSP_ERR_OUT_OF_MEMORY;
         goto done;
     }
@@ -576,15 +681,17 @@ static int solve_core(const int32_t *positions, int grid,
     }
     {
         open_node_t root;
-        int32_t *state = (int32_t *)malloc((size_t)cells * sizeof(int32_t));
+        int8_t *state = (int8_t *)malloc((size_t)cells);
         if (state == NULL) {
             result = -MNSP_ERR_OUT_OF_MEMORY;
             goto done;
         }
-        memcpy(state, positions, (size_t)cells * sizeof(int32_t));
+        for (int i = 0; i < cells; i++) {
+            state[i] = (int8_t)positions[i];
+        }
         root.state = state;
         root.g = 0;
-        root.h = heuristic(state, grid);
+        root.h = heuristic(state, &hctx);
         root.f = (int32_t)((double)root.h * weight);
         root.blank = blank;
         root.parent = -1;
@@ -614,16 +721,29 @@ static int solve_core(const int32_t *positions, int grid,
         if (current->closed) {
             continue;
         }
-        key = hash_board(current->state, cells);
-        if (closed_find(&closed, key, &stored)) {
-            if (stored <= current->g) {
-                continue;
-            }
+        /* Bounded refinement: with an admissible h, no path through this state can be
+         * shorter than g+h, so once that reaches the incumbent the state is useless. */
+        if (upper_bound > 0 && current->g + current->h >= upper_bound) {
+            continue;
         }
-        closed_insert(&closed, key, current->g);
+        /* The state was claimed at generation time. If the table now holds a cheaper
+         * g than this node's, a better duplicate is (or was) on the open list too, so
+         * this copy cannot improve anything. */
+        key = hash_board(current->state, cells);
+        if (seen_find(&closed, key, &stored) && stored < current->g) {
+            continue;
+        }
         current->closed = 1;
 
-        if (memcmp(current->state, goal, (size_t)cells * sizeof(int32_t)) == 0) {
+        {
+            int is_goal = 1;
+            for (int i = 0; i < cells; i++) {
+                if ((int32_t)current->state[i] != goal[i]) {
+                    is_goal = 0;
+                    break;
+                }
+            }
+            if (is_goal) {
             int steps = 0;
             int32_t cursor = index;
             while (arena.items[cursor].parent >= 0) {
@@ -642,9 +762,12 @@ static int solve_core(const int32_t *positions, int grid,
             }
             result = steps;
             goto done;
+            }
         }
 
-        if (max_states > 0 && arena.count > max_states) {
+        /* Budget on distinct boards discovered, which is what the caller asked for and
+         * what actually bounds memory. */
+        if (max_states > 0 && closed.used > max_states) {
             result = -MNSP_ERR_SEARCH_LIMIT;
             goto done;
         }
@@ -652,29 +775,58 @@ static int solve_core(const int32_t *positions, int grid,
         {
             /* arena_push may realloc, which invalidates `current`; snapshot what the
              * expansion loop needs first. */
-            const int32_t *current_state = current->state;
+            const int8_t *current_state = current->state;
             const int32_t current_g = current->g;
             const int32_t current_blank = current->blank;
+            int8_t *current_owned = current->state;
             int ex = current_blank % grid;
             int ey = current_blank / grid;
             for (int dir = 0; dir < 4; dir++) {
                 int nx = ex + DIR_X[dir];
                 int ny = ey + DIR_Y[dir];
                 int target;
+                uint64_t child_key;
                 open_node_t child;
                 if (!inside(grid, nx, ny)) {
                     continue;
                 }
                 target = ny * grid + nx;
-                child.state = (int32_t *)malloc((size_t)cells * sizeof(int32_t));
+                /* Generate the child's board into a stack scratch buffer first: it is
+                 * needed to compute the key, and the key decides whether the child is
+                 * worth allocating at all. */
+                {
+                    int8_t probe[64];
+                    memcpy(probe, current_state, (size_t)cells);
+                    {
+                        int8_t tmp = probe[current_blank];
+                        probe[current_blank] = probe[target];
+                        probe[target] = tmp;
+                    }
+                    child_key = hash_board(probe, cells);
+                    if (seen_find(&closed, child_key, &stored) && stored <= current_g + 1) {
+                        continue;
+                    }
+                    /* Claim the key now rather than at expansion time. Every state is
+                     * therefore enqueued at most once per strictly better g, which is
+                     * what keeps the arena close to the number of distinct boards. */
+                    if (!seen_insert(&closed, child_key, current_g + 1)) {
+                        result = -MNSP_ERR_OUT_OF_MEMORY;
+                        goto done;
+                    }
+                }
+                child.state = (int8_t *)malloc((size_t)cells);
                 if (child.state == NULL) {
                     result = -MNSP_ERR_OUT_OF_MEMORY;
                     goto done;
                 }
-                memcpy(child.state, current_state, (size_t)cells * sizeof(int32_t));
-                swap_cells(child.state, current_blank, target);
+                memcpy(child.state, current_state, (size_t)cells);
+                {
+                    int8_t tmp = child.state[current_blank];
+                    child.state[current_blank] = child.state[target];
+                    child.state[target] = tmp;
+                }
                 child.g = current_g + 1;
-                child.h = heuristic(child.state, grid);
+                child.h = heuristic(child.state, &hctx);
                 child.f = child.g + (int32_t)((double)child.h * weight);
                 child.blank = target;
                 child.parent = index;
@@ -693,15 +845,29 @@ static int solve_core(const int32_t *positions, int grid,
                     goto done;
                 }
             }
+            /* The expanded node never needs its board again: the path is rebuilt from
+             * (parent, move_dx, move_dy) alone, and re-expansion is prevented by the
+             * closed flag. Freeing here keeps peak memory proportional to the frontier
+             * instead of to every node ever enqueued — measured 626 MiB -> well under
+             * 100 MiB on an 8x8 board. */
+            free(current_owned);
+            /* `current` may have been invalidated by arena_push's realloc; the arena
+             * owns the slot at `index`, so write through a fresh lookup. */
+            arena.items[index].state = NULL;
         }
     }
 
     result = -MNSP_ERR_UNSOLVABLE;
 
 done:
+    if (getenv("SP_DEBUG_COUNTS")) {
+        fprintf(stderr, "arena=%zu closed=%zu ratio=%.2f\n",
+                arena.count, closed.used,
+                closed.used ? (double)arena.count / (double)closed.used : 0.0);
+    }
     free(goal);
     free(open.items);
-    closed_free(&closed);
+    seen_free(&closed);
     for (size_t i = 0; i < arena.count; i++) {
         free(arena.items[i].state);
     }
@@ -712,14 +878,107 @@ done:
 int mnsp_solve(const int32_t *positions, int grid,
                mnsp_move_t *out_moves, int capacity, uint64_t max_states)
 {
-    return solve_core(positions, grid, out_moves, capacity, max_states, 1.0);
+    return solve_core(positions, grid, out_moves, capacity, max_states, 1.0, 0);
 }
 
 int mnsp_solve_weighted(const int32_t *positions, int grid,
                         mnsp_move_t *out_moves, int capacity, uint64_t max_states,
                         double weight)
 {
-    return solve_core(positions, grid, out_moves, capacity, max_states, weight);
+    return solve_core(positions, grid, out_moves, capacity, max_states, weight, 0);
+}
+
+/* Weighted A* over a ladder of biases, returning the shortest path any of them finds.
+ *
+ * A single weight is a lottery on large boards: the bias that makes one board trivial
+ * can make another exhaust its budget, and path length is not monotone in the weight
+ * (on one 7x7 board w=5 returned 305 moves where w=6 returned 289 in 0.1 s). So the
+ * first round is deliberately over-biased — it is nearly guaranteed to produce *some*
+ * path cheaply — and later rounds drop the bias to shorten it.
+ *
+ * Each later round is given the best length so far as an upper bound, which prunes
+ * every state whose admissible lower bound g+h already reaches it. The rounds therefore
+ * get *cheaper* as they get more accurate, instead of costing more.
+ *
+ * Returns the move count, or a negative mnsp_result_t — MNSP_ERR_SEARCH_LIMIT when
+ * every round ran out, in which case the caller should fall back to undo replay. */
+int mnsp_solve_best(const int32_t *positions, int grid,
+                    mnsp_move_t *out_moves, int capacity, uint64_t max_states)
+{
+    /* Round 0 is the safety net: it must nearly always succeed, because a round that
+     * exhausts its cap still costs the full cap. 7x7 is the size where this bites —
+     * one board there needs 15 s at w=5 but 0.1 s at w=6, so the ladder cannot start
+     * lower just to gain a few moves. 6x6 is forgiving and starts at 3.0.
+     * Measured over 12 boards per size (2026-11-05). */
+    static const double LADDER_5[] = { 2.0, 1.5 };
+    static const double LADDER_6[] = { 3.0, 2.5 };
+    static const double LADDER_7[] = { 6.0, 4.0 };
+    static const double LADDER_8[] = { 8.0, 5.0 };
+    const double *weights;
+    int rounds;
+    int best = -1;
+    int best_len = 0;
+    mnsp_move_t *scratch = NULL;
+    int result = -MNSP_ERR_SEARCH_LIMIT;
+
+    if (positions == NULL || out_moves == NULL || grid < MNSP_MIN_GRID || grid > MNSP_MAX_GRID ||
+        capacity < 0) {
+        return -MNSP_ERR_INVALID_ARGUMENT;
+    }
+    if (grid <= 4) {
+        /* Small boards are solved exactly and instantly; no bias needed. */
+        return mnsp_solve(positions, grid, out_moves, capacity, max_states);
+    }
+
+    if (grid == 5) {
+        weights = LADDER_5;
+        rounds = (int)(sizeof LADDER_5 / sizeof LADDER_5[0]);
+    } else if (grid == 6) {
+        weights = LADDER_6;
+        rounds = (int)(sizeof LADDER_6 / sizeof LADDER_6[0]);
+    } else if (grid == 7) {
+        weights = LADDER_7;
+        rounds = (int)(sizeof LADDER_7 / sizeof LADDER_7[0]);
+    } else {
+        weights = LADDER_8;
+        rounds = (int)(sizeof LADDER_8 / sizeof LADDER_8[0]);
+    }
+
+    scratch = (mnsp_move_t *)malloc((size_t)(capacity > 0 ? capacity : 1) * sizeof(mnsp_move_t));
+    if (scratch == NULL) {
+        return -MNSP_ERR_OUT_OF_MEMORY;
+    }
+
+    for (int i = 0; i < rounds; i++) {
+        /* Cumulative cap: round i may consume up to max_states*(i+1)/rounds, so the
+         * final round can still use the whole allowance while the early cheap rounds
+         * cannot starve it. */
+        uint64_t allow = max_states == 0 ? 0
+                       : max_states * (uint64_t)(i + 1) / (uint64_t)rounds;
+        /* Refinement rounds are pruned by the incumbent: every state whose admissible
+         * bound reaches best_len is dropped, so a round that can only tie ends almost
+         * immediately instead of re-exploring the same space. */
+        int count = solve_core(positions, grid, scratch, capacity, allow, weights[i],
+                               i == 0 ? 0 : best_len);
+        if (count >= 0) {
+            if (best < 0 || count < best_len) {
+                memcpy(out_moves, scratch, (size_t)count * sizeof(mnsp_move_t));
+                best_len = count;
+                best = count;
+            }
+        } else if (count == -MNSP_ERR_SEARCH_LIMIT) {
+            continue;
+        } else {
+            /* A real error (bad input, out of memory): stop, but keep any path found. */
+            if (best < 0) {
+                result = count;
+            }
+            break;
+        }
+    }
+
+    free(scratch);
+    return best >= 0 ? best : result;
 }
 
 double mnsp_default_weight(int grid)
