@@ -1,0 +1,24 @@
+# Build output
+build/
+build-*/
+cmake-build-*/
+
+# Editor / tooling
+.cache/
+compile_commands.json
+*.o
+*.a
+*.so
+*.dylib
+
+# Captured device screenshots: large, machine-specific, kept in the research
+# workspace instead (work/126_slide-puzzle-analysis/cases/).
+tests/fixtures/real/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Python bytecode
+__pycache__/
+*.pyc
