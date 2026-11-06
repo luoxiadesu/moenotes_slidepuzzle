@@ -19,6 +19,16 @@
 #include <sys/stat.h>
 #include <zlib.h>
 
+/* The tests drive the exporter through a shell so they exercise the real binary. That
+ * is POSIX syntax throughout (quoting, /dev/null, ulimit), so on Windows the suite is
+ * skipped rather than made to fail for a reason that has nothing to do with the code
+ * under test. */
+#if defined(_WIN32)
+#define MNSP_HAVE_SHELL 0
+#else
+#define MNSP_HAVE_SHELL 1
+#endif
+
 #ifndef MNSP_EXPORT_TEST_DIR
 #define MNSP_EXPORT_TEST_DIR "test-export"
 #endif
@@ -276,6 +286,10 @@ static void test_write_failure_is_reported(void)
 
 int main(void)
 {
+#if !MNSP_HAVE_SHELL
+    puts("test_export: skipped (needs a POSIX shell to drive the exporter)");
+    return 0;
+#else
     assert(generate_fixtures());
     test_export_small_boards();
     test_export_five_by_five();
@@ -284,4 +298,5 @@ int main(void)
     test_write_failure_is_reported();
     puts("test_export: ok");
     return 0;
+#endif
 }

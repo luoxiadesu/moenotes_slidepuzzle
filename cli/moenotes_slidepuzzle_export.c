@@ -39,8 +39,13 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <signal.h>
-#include <unistd.h>
 #include <time.h>
+#if defined(_WIN32)
+#include <direct.h>
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <zlib.h>
 
 #define EXPORT_SCHEMA 1
@@ -318,9 +323,15 @@ static int ensure_dir(const char *path)
     if (stat(path, &info) == 0) {
         return S_ISDIR(info.st_mode) ? 0 : -1;
     }
+#if defined(_WIN32)
+    if (_mkdir(path) != 0 && errno != EEXIST) {
+        return -1;
+    }
+#else
     if (mkdir(path, 0755) != 0 && errno != EEXIST) {
         return -1;
     }
+#endif
     return 0;
 }
 
@@ -504,7 +515,11 @@ static int acquire_lock(const char *dir)
     if (file == NULL) {
         return 0;
     }
+#if defined(_WIN32)
+    fprintf(file, "%d\n", _getpid());
+#else
     fprintf(file, "%ld\n", (long)getpid());
+#endif
     fclose(file);
     return 1;
 }
