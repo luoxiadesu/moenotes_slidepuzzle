@@ -22,3 +22,7 @@ Thumbs.db
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Superseded, known-broken PDB (blank-costed patterns). Replaced by src/sp_pdb.c;
+# kept only as a research record in the workspace.
+work-in-progress/

@@ -118,6 +118,66 @@ int mnsp_solve_best(const int32_t *positions, int grid,
 double mnsp_default_weight(int grid);
 uint64_t mnsp_default_budget(int grid);
 
+/* ------------------------------------------------- pattern database (5x5 only)
+ *
+ * A disjoint pattern database heuristic: four groups of six tiles, summed. It is
+ * admissible (never overestimates), so it can drive any optimal search, and it is
+ * much stronger than Manhattan plus linear conflict: on real boards it is about
+ * 0.7-0.8 of the true optimum, where Manhattan+LC is about 0.6.
+ *
+ * The tables are large (about 486 MiB for the default 6-tile split) and take about
+ * three minutes to build. Every function that needs them takes an explicit handle --
+ * there is no global state, so independent instances are safe to use concurrently.
+ *
+ * Two things the PDB does NOT do:
+ *   - it does not make 5x5 optimal solving fast. With w=1 the search takes 0.8-77 s
+ *     per board and some boards exceed any practical budget.
+ *   - it is not available for grids other than 5. mnsp_pdb_create returns NULL there,
+ *     and every other entry point returns -1 / 0.
+ *
+ * Intended use is a stronger heuristic for weighted search; see mnsp_solve_pdb. */
+typedef struct mnsp_pdb mnsp_pdb_t;
+
+/* 1 when this grid has a pattern database. */
+int mnsp_pdb_supported(int grid);
+
+/* Build the tables. Returns NULL for an unsupported grid or when out of memory.
+ * Release with mnsp_pdb_destroy. */
+mnsp_pdb_t *mnsp_pdb_create(int grid);
+
+/* Release the tables and the handle. Safe to call with NULL. */
+void mnsp_pdb_destroy(mnsp_pdb_t *pdb);
+
+/* 1 when the handle holds usable tables. */
+int mnsp_pdb_ready(const mnsp_pdb_t *pdb);
+
+/* Admissible heuristic: the sum of the four pattern databases. Returns -1 when the
+ * handle is not ready, the grid is not 5, or the board is invalid. Never exceeds the
+ * true optimal distance. */
+int mnsp_pdb_heuristic(const mnsp_pdb_t *pdb, const int32_t *positions, int grid);
+
+/* Weighted IDA* driven by the pattern database.
+ *
+ * An in-between point between mnsp_solve_best and exact search: weight > 1 trades
+ * optimality for speed exactly like weighted A*. Measured over all 84 built-in songs
+ * at 5x5 with weight 1.5, this returns paths 13% shorter than mnsp_solve_best on
+ * average, and completes within a second on 61 of the 84.
+ *
+ * IDA* keeps only the current path, so memory is O(solution length) rather than the
+ * max_states budget mnsp_solve_best needs. `max_nodes` bounds the work instead.
+ *
+ * Returns the move count, MNSP_ERR_SEARCH_LIMIT when max_nodes is exceeded (the
+ * caller should fall back to mnsp_solve_best), or another negative mnsp_result_t. */
+int mnsp_solve_pdb(const mnsp_pdb_t *pdb, const int32_t *positions, int grid,
+                   mnsp_move_t *out_moves, int capacity,
+                   double weight, uint64_t max_nodes);
+
+/* Exact optimal solve with the pattern database (weight 1). Slow: measured 0.8-77 s
+ * on real boards, and hard instances may exceed any practical max_nodes.
+ * Returns the move count or a negative mnsp_result_t. */
+int mnsp_solve_optimal(const mnsp_pdb_t *pdb, const int32_t *positions, int grid,
+                       mnsp_move_t *out_moves, int capacity, uint64_t max_nodes);
+
 /* 1 when the permutation is solvable, 0 otherwise. */
 int mnsp_solvable(const int32_t *positions, int grid);
 

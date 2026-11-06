@@ -108,6 +108,34 @@ boards (average 408 moves).
 default) searches and only replays the shuffle backwards, with a note on stderr, when
 the budget is exceeded.
 
+### Optional: pattern-database search (`--quality`)
+
+A disjoint pattern database (four groups of six tiles, summed) gives a much stronger
+admissible heuristic than Manhattan plus linear conflict, which makes weighted IDA*
+return shorter paths. Measured over all 84 built-in songs at 5x5:
+
+| | standard search | `--quality` (w=1.5) |
+|---|---|---|
+| mean moves | 78.5 | **68.2 (-13.1%)** |
+| worst moves | 109 | **89 (-18.3%)** |
+| better / equal / worse | - | **82 / 2 / 0** |
+| total time | 9.7 s | 166.8 s |
+
+It is opt-in because the tables cost **486 MiB of RAM and about three minutes to
+build**, and on 17 of the 84 boards the search exceeds a one-second budget. With
+`--quality` a node limit applies (`--quality-nodes`, default 200M); when it runs out
+the command falls back to the standard search automatically.
+
+```bash
+./build/moenotes_slidepuzzle solve 100001 5 --quality
+./build/moenotes_slidepuzzle solve 100001 5 --quality --quality-nodes 50000000
+```
+
+`mnsp_solve_optimal` (C API only) goes further and returns a provably shortest path,
+but takes 0.8-77 s per board on real songs and does not finish on the hardest ones.
+That is not an implementation gap: 5x5 optimal solving is a minutes-to-hours problem
+(see `docs/110_slide-puzzle-optimal-pdb.md`).
+
 ## API
 
 ```c

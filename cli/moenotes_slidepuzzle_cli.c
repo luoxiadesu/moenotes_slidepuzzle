@@ -21,6 +21,11 @@ static void usage(FILE *out)
           "                              only replays the shuffle when search is too slow.\n"
           "                              --max-states caps distinct boards explored (default\n"
           "                              depends on size); lower it to bound peak memory\n"
+          "        [--quality] [--quality-weight W] [--quality-nodes N]\n"
+          "                              also try the pattern-database search first (5x5 only).\n"
+          "                              About 13% shorter paths on average; costs ~3 min of\n"
+          "                              table building and 486 MiB of RAM. Falls back to the\n"
+          "                              standard search when the node budget runs out.\n"
           "  solve-state <grid> <p0,p1,...>\n"
           "                              solve an arbitrary board\n"
           "  read <screenshot> <jacket> <grid> [--solve]\n"
@@ -145,6 +150,9 @@ static int command_solve(int argc, char **argv)
     int count;
     const char *strategy = "auto";
     uint64_t budget = 0;
+    int quality = 0;
+    double quality_weight = 1.5;
+    uint64_t quality_nodes = 200000000ull;
 
     if (argc < 4 || !parse_int(argv[2], &music_id) || !parse_int(argv[3], &grid)) {
         return 2;
@@ -158,6 +166,22 @@ static int command_solve(int argc, char **argv)
                 return 2;
             }
             budget = (uint64_t)parsed;
+        } else if (strcmp(argv[i], "--quality") == 0) {
+            quality = 1;
+        } else if (strcmp(argv[i], "--quality-weight") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            quality_weight = strtod(argv[++i], &end);
+            if (end == argv[i] || *end != '\0' || quality_weight < 1.0) {
+                return 2;
+            }
+            quality = 1;
+        } else if (strcmp(argv[i], "--quality-nodes") == 0 && i + 1 < argc) {
+            long long parsed;
+            if (!parse_ll(argv[++i], &parsed) || parsed <= 0) {
+                return 2;
+            }
+            quality_nodes = (uint64_t)parsed;
+            quality = 1;
         } else {
             return 2;
         }
@@ -167,6 +191,37 @@ static int command_solve(int argc, char **argv)
     }
     if (budget == 0) {
         budget = mnsp_default_budget((int)grid);
+    }
+
+    /* --quality: try the pattern-database guided search first. It is available for 5x5
+     * only and may exceed its node budget on hard boards, in which case we fall back
+     * to the regular path below. Building the tables takes about three minutes, so
+     * this is opt-in rather than a default. */
+    if (quality && strcmp(strategy, "undo") != 0) {
+        mnsp_pdb_t *pdb = mnsp_pdb_create((int)grid);
+        if (pdb == NULL) {
+            fprintf(stderr, "note: no pattern database for grid %ld; using the standard search\n",
+                    grid);
+        } else {
+            count = mnsp_solve_pdb(pdb, positions, (int)grid, moves, 4096,
+                                   quality_weight, quality_nodes);
+            mnsp_pdb_destroy(pdb);
+            if (count >= 0) {
+                printf("musicId=%ld grid=%ld moves=%d strategy=pdb weight=%.2f\n",
+                       music_id, grid, count, quality_weight);
+                for (int i = 0; i < count; i++) {
+                    putchar(move_letter(moves[i]));
+                }
+                putchar('\n');
+                return 0;
+            }
+            if (count != -MNSP_ERR_SEARCH_LIMIT && count != -MNSP_ERR_RANGE) {
+                return fail(mnsp_result_string((mnsp_result_t)(-count)));
+            }
+            fprintf(stderr,
+                    "note: the pattern-database search hit its budget; falling back to the\n"
+                    "      standard weighted search.\n");
+        }
     }
 
     /* auto: search first (much shorter paths), fall back to replaying the shuffle

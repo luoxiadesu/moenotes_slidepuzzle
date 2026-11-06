@@ -13,6 +13,8 @@ set(CMAKE_C_EXTENSIONS OFF)
 add_library(moenotes_slidepuzzle STATIC
     src/sp_rng.c
     src/sp_puzzle.c
+    src/sp_ida.c
+    src/sp_pdb.c
     src/sp_image.c
     src/sp_board.c
     src/sp_match.c
@@ -48,7 +50,7 @@ install(FILES include/moenotes_slidepuzzle.h DESTINATION ${CMAKE_INSTALL_INCLUDE
 
 if(MOENOTES_BUILD_TESTS)
     enable_testing()
-    foreach(test_name rng puzzle read jacket)
+    foreach(test_name rng puzzle read jacket pdb_api)
         add_executable(test_${test_name} tests/test_${test_name}.c)
         target_link_libraries(test_${test_name} PRIVATE moenotes_slidepuzzle)
         target_include_directories(test_${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
