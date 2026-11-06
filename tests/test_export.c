@@ -324,6 +324,68 @@ static void test_numeric_options_are_strict(void)
     printf("  trailing garbage rejected\n");
 }
 
+/* A path long enough to truncate must be rejected, not silently write several boards
+ * into one file. */
+static void test_long_out_dir_is_rejected(void)
+{
+    static char dir[1200];
+    char command[2400];
+    int status;
+
+    /* Build a directory whose length lands just under the exporter's 1024-byte buffer
+     * so the board file name would be cut off. */
+    snprintf(dir, sizeof dir, "%s/long", MNSP_EXPORT_TEST_DIR);
+    while (strlen(dir) < 1010) {
+        strncat(dir, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 
+                sizeof dir - strlen(dir) - 1);
+    }
+    /* The path is long enough that mkdir itself may refuse; the exporter must reject
+     * it either way, so the creation result is not asserted. */
+    snprintf(command, sizeof command, "mkdir -p \"%s\" 2>/dev/null", dir);
+    (void)!system(command);
+
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --music 100001 --music 100050 "
+             "--grid 3 --grid 4 >/dev/null 2>&1",
+             MNSP_EXPORT_BINARY, dir);
+    status = system(command);
+    assert(status != 0);   /* must refuse rather than collide */
+    printf("  over-long --out rejected\n");
+}
+
+/* A file stamped with a different schema must be rebuilt, not resumed past. */
+static void test_resume_rejects_wrong_schema(void)
+{
+    char dir[512];
+    char path[600];
+    char command[4096];
+    struct stat before;
+
+    snprintf(dir, sizeof dir, "%s/schema", MNSP_EXPORT_TEST_DIR);
+    snprintf(path, sizeof path, "%s/100050_3.jsonl.gz", dir);
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --music 100050 --grid 3 >/dev/null 2>&1",
+             MNSP_EXPORT_BINARY, dir);
+    assert(system(command) == 0);
+    assert(stat(path, &before) == 0);
+
+    snprintf(command, sizeof command,
+             "zcat \"%s\" | sed 's/\"schema\":1/\"schema\":99/' | gzip > \"%s.n\" "
+             "&& mv \"%s.n\" \"%s\"", path, path, path, path);
+    assert(system(command) == 0);
+
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --music 100050 --grid 3 --resume "
+             ">/dev/null 2>&1", MNSP_EXPORT_BINARY, dir);
+    assert(system(command) == 0);
+
+    /* Rebuilt means the schema marker is 1 again. */
+    snprintf(command, sizeof command, "zcat \"%s\" | head -1 | grep -q '\"schema\":1'",
+             path);
+    assert(system(command) == 0);
+    printf("  --resume rebuilt a wrong-schema file\n");
+}
+
 /* A full disk must fail the run, not silently produce a truncated file. The file-size
  * rlimit reproduces it without needing to fill a real filesystem: with SIGXFSZ ignored
  * the write returns EFBIG and the exporter reports the failure.
@@ -360,7 +422,7 @@ int main(void)
 {
 #if !MNSP_HAVE_SHELL
     puts("test_export: skipped (needs a POSIX shell to drive the exporter)");
-    return 0;
+    return 77;   /* CTest SKIP_RETURN_CODE: a skip must not look like a pass */
 #else
     assert(generate_fixtures());
     test_export_small_boards();
@@ -370,6 +432,8 @@ int main(void)
     test_plain_index_is_not_gzip();
     test_resume_rebuilds_truncated_gzip();
     test_numeric_options_are_strict();
+    test_long_out_dir_is_rejected();
+    test_resume_rejects_wrong_schema();
     test_write_failure_is_reported();
     puts("test_export: ok");
     return 0;

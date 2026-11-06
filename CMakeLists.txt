@@ -79,6 +79,9 @@ if(MOENOTES_BUILD_TESTS)
         # reads what it wrote. It needs zlib to read the gzip'd output back.
         add_executable(test_export tests/test_export.c)
         target_link_libraries(test_export PRIVATE moenotes_slidepuzzle ZLIB::ZLIB)
+        # The test drives the real CLI, so building it alone must build that too.
+        # $<TARGET_FILE:...> only expands a path and creates no dependency.
+        add_dependencies(test_export moenotes_slidepuzzle_cli)
         target_compile_definitions(test_export PRIVATE
             MNSP_EXPORT_TEST_DIR="${CMAKE_CURRENT_BINARY_DIR}/test-export"
             MNSP_EXPORT_BINARY="$<TARGET_FILE:moenotes_slidepuzzle_cli>")
@@ -86,5 +89,8 @@ if(MOENOTES_BUILD_TESTS)
             target_compile_options(test_export PRIVATE -UNDEBUG)
         endif()
         add_test(NAME export COMMAND test_export)
+        # The suite shells out to the exporter; where no POSIX shell exists it prints a
+        # skip notice and exits 77, which CTest reports as skipped rather than passed.
+        set_tests_properties(export PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 endif()

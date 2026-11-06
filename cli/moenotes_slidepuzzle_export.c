@@ -33,6 +33,7 @@
 #include "moenotes_slidepuzzle.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,7 +62,9 @@ typedef enum export_strategy {
 
 typedef struct export_options {
     const char *out_dir;
-    const char *index_path;
+    char index_path[1024];
+    char index_tmp_path[1024];
+    int index_path_used;
     int grids[MNSP_MAX_GRID + 1];   /* 1 = enabled */
     int any_grid;                   /* 0 = all supported sizes */
     int32_t music[256];
@@ -380,17 +383,51 @@ static int ensure_dir(const char *path)
     return 0;
 }
 
-static void build_path(char *buffer, size_t capacity, const char *dir,
-                       int32_t music_id, int grid, const char *suffix)
+/* Returns 0 when the whole path fit. A truncated path is not a harmless short name:
+ * it is still a valid path, so open/rename succeed and several boards silently
+ * overwrite each other while the summary reports success. */
+static int build_path(char *buffer, size_t capacity, const char *dir,
+                      int32_t music_id, int grid, const char *suffix)
 {
-    snprintf(buffer, capacity, "%s/%d_%d.jsonl%s", dir, (int)music_id, grid, suffix);
+    int written = snprintf(buffer, capacity, "%s/%d_%d.jsonl%s", dir,
+                           (int)music_id, grid, suffix);
+    return (written > 0 && (size_t)written < capacity) ? 0 : -1;
 }
 
 /* --resume: a finished file is one that exists, is non-empty, and carries the schema
  * marker we are writing now. A truncated or older file is rebuilt. */
-static int cache_is_valid(const char *path, int compress)
+/* Parses the four fields that identify a complete export of one board.
+ * Returns 1 when the line is well formed and matches the expected identity. */
+static int meta_matches(const char *line, int32_t music_id, int grid)
 {
-    char line[512];
+    long schema = -1, found_music = -1, found_grid = -1, length = -1;
+    const char *p;
+
+    p = strstr(line, "\"schema\":");
+    if (p == NULL) return 0;
+    schema = strtol(p + 9, NULL, 10);
+
+    p = strstr(line, "\"musicId\":");
+    if (p == NULL) return 0;
+    found_music = strtol(p + 10, NULL, 10);
+
+    p = strstr(line, "\"grid\":");
+    if (p == NULL) return 0;
+    found_grid = strtol(p + 7, NULL, 10);
+
+    p = strstr(line, "\"solutionLength\":");
+    if (p == NULL) return 0;
+    length = strtol(p + 17, NULL, 10);
+
+    /* Only a substring test was done before, so a file stamped schema 99, or one that
+     * was renamed from another board, passed as complete. */
+    return schema == EXPORT_SCHEMA && found_music == (long)music_id &&
+           found_grid == grid && length >= 0;
+}
+
+static int cache_is_valid(const char *path, int compress, int32_t music_id, int grid)
+{
+    char line[8192];
     int ok = 0;
 
     if (compress) {
@@ -399,48 +436,44 @@ static int cache_is_valid(const char *path, int compress)
             return 0;
         }
         /* A truncation test is not enough: a .gz cut in half still starts with the
-         * magic bytes, and --resume would then skip a file that no reader can open.
-         * Reading to EOF makes zlib verify the trailer and report Z_DATA_ERROR or a
-         * short read on a damaged stream. The cost is one pass over a file that is
-         * already in the page cache, which is far cheaper than re-solving the board. */
-        if (gzgets(file, line, sizeof line) != NULL) {
-            int header_ok = strstr(line, "\"schema\":") != NULL;
+         * magic bytes, and --resume would then skip a file no reader can open.
+         * Reading to EOF makes zlib verify the trailer. */
+        if (gzgets(file, line, sizeof line) != NULL && meta_matches(line, music_id, grid)) {
             char scratch[8192];
-            int read_error = 0;
             while (gzgets(file, scratch, sizeof scratch) != NULL) {
                 /* drain */
             }
-            /* gzerror returns a string, not the code; the code comes through the
-             * int* out-parameter. Passing NULL there and comparing the string was
-             * wrong and made every complete file look damaged. */
             {
                 int error_code = 0;
                 (void)gzerror(file, &error_code);
-                if (gzeof(file) && error_code == Z_OK && header_ok) {
+                if (gzeof(file) && error_code == Z_OK) {
                     ok = 1;
                 }
             }
-            (void)read_error;
         }
         gzclose(file);
         return ok;
     }
     {
         FILE *file = fopen(path, "rb");
+        long last;
         if (file == NULL) {
             return 0;
         }
-        if (fgets(line, sizeof line, file) != NULL) {
-            ok = strstr(line, "\"schema\":") != NULL;
-        }
-        /* Plain mode: a truncated file has no trailing newline on its last line, but
-         * checking that reliably means reading to EOF too. Do it for symmetry. */
-        if (ok) {
+        if (fgets(line, sizeof line, file) != NULL && meta_matches(line, music_id, grid)) {
             char scratch[8192];
             while (fgets(scratch, sizeof scratch, file) != NULL) {
                 /* drain */
             }
-            ok = feof(file) != 0 && ferror(file) == 0;
+            ok = ferror(file) == 0;
+        }
+        /* A truncated text file still reaches EOF without setting an error, so the
+         * last byte has to be checked: every complete record ends with a newline. */
+        if (ok && fseek(file, -1, SEEK_END) == 0) {
+            last = fgetc(file);
+            ok = last == '\n';
+        } else {
+            ok = 0;
         }
         fclose(file);
         return ok;
@@ -463,8 +496,14 @@ static int export_board(const export_options_t *options, mnsp_pdb_t *pdb,
     export_sink_t *out;
     int count;
 
-    build_path(path, sizeof path, options->out_dir, music_id, grid, suffix);
-    if (options->resume && cache_is_valid(path, options->compress)) {
+    if (build_path(path, sizeof path, options->out_dir, music_id, grid, suffix) != 0 ||
+        build_path(temp, sizeof temp, options->out_dir, music_id, grid, ".tmp") != 0) {
+        snprintf(error, error_size,
+                 "output path too long for the %d-byte buffer; use a shorter --out",
+                 (int)sizeof path);
+        return -1;
+    }
+    if (options->resume && cache_is_valid(path, options->compress, music_id, grid)) {
         /* The file is already complete, but the index still needs a row. Read the
          * metadata line back so the reported length and solver are the real ones
          * rather than placeholders. */
@@ -499,7 +538,6 @@ static int export_board(const export_options_t *options, mnsp_pdb_t *pdb,
 
     /* Write to a temporary name and rename at the end, so an interrupted run never
      * leaves a half-written file that --resume would mistake for complete. */
-    build_path(temp, sizeof temp, options->out_dir, music_id, grid, ".tmp");
     out = sink_open(temp, options->compress);
     if (out == NULL) {
         snprintf(error, error_size, "cannot open the temporary output file");
@@ -569,10 +607,13 @@ static int write_index(const export_options_t *options, int32_t music_id, int gr
     export_sink_t *index;
     int status;
 
-    if (options->index_path == NULL) {
+    if (options->index_path_used == 0) {
         return 0;
     }
-    index = sink_open_append(options->index_path, options->compress);
+    /* Appended to a temporary file; renamed into place only after the whole run
+     * succeeds. An index written directly would be left truncated by a crash or a
+     * full disk, and a truncated gzip index parses right up to the cut. */
+    index = sink_open_append(options->index_tmp_path, options->compress);
     if (index == NULL) {
         return -1;
     }
@@ -595,7 +636,13 @@ static char g_lock_path[1024];
 static int acquire_lock(const char *dir)
 {
     FILE *file;
-    snprintf(g_lock_path, sizeof g_lock_path, "%s/.export.lock", dir);
+    {
+        int written = snprintf(g_lock_path, sizeof g_lock_path, "%s/.export.lock", dir);
+        if (written <= 0 || (size_t)written >= sizeof g_lock_path) {
+            g_lock_path[0] = '\0';
+            return -1;   /* path too long; distinct from "lock held" */
+        }
+    }
     /* "wx" fails when the file already exists, which is exactly the check we want. */
     file = fopen(g_lock_path, "wx");
     if (file == NULL) {
@@ -675,9 +722,13 @@ static int parse_args(int argc, char **argv, export_options_t *options)
             int duplicate = 0;
             /* strtol alone accepts "100001x" as 100001, silently exporting a board
              * for a number the user did not type. Require the whole argument. */
+            /* strtol saturates silently on overflow and the value is narrowed to
+             * int32 below, so 2^32+100001 would wrap to 100001 and export a board
+             * for a song the user never named. Reject anything outside int32. */
+            errno = 0;
             value = strtol(argv[++i], &end, 10);
-            if (end == argv[i] || *end != '\0' || value <= 0 ||
-                options->music_count >= 256) {
+            if (end == argv[i] || *end != '\0' || value <= 0 || errno == ERANGE ||
+                value > INT32_MAX || options->music_count >= 256) {
                 fprintf(stderr,
                         "moenotes_slidepuzzle: --music needs a numeric song id, got \"%s\"\n",
                         argv[i]);
@@ -733,10 +784,21 @@ static int parse_args(int argc, char **argv, export_options_t *options)
         }
     }
     if (options->want_index) {
-        static char index_path[1024];
-        snprintf(index_path, sizeof index_path, "%s/index.jsonl%s",
-                 options->out_dir, options->compress ? ".gz" : "");
-        options->index_path = index_path;
+        int written = snprintf(options->index_path, sizeof options->index_path,
+                               "%s/index.jsonl%s", options->out_dir,
+                               options->compress ? ".gz" : "");
+        if (written <= 0 || (size_t)written >= sizeof options->index_path) {
+            fprintf(stderr,
+                    "moenotes_slidepuzzle: --out is too long to place index.jsonl "
+                    "beside the boards; use a shorter path\n");
+            return -2;
+        }
+        written = snprintf(options->index_tmp_path, sizeof options->index_tmp_path,
+                           "%s.tmp", options->index_path);
+        if (written <= 0 || (size_t)written >= sizeof options->index_tmp_path) {
+            return -2;
+        }
+        options->index_path_used = 1;
     }
     return 0;
 }
@@ -764,12 +826,21 @@ int mnsp_export_command(int argc, char **argv)
         fprintf(stderr, "moenotes_slidepuzzle: cannot create %s\n", options.out_dir);
         return 1;
     }
-    if (!acquire_lock(options.out_dir)) {
-        fprintf(stderr,
-                "moenotes_slidepuzzle: another export is already writing to %s\n"
-                "  (remove %s/.export.lock if that is stale)\n",
-                options.out_dir, options.out_dir);
-        return 1;
+    {
+        int lock_status = acquire_lock(options.out_dir);
+        if (lock_status < 0) {
+            fprintf(stderr,
+                    "moenotes_slidepuzzle: --out is too long to place a lock file "
+                    "inside it; use a shorter path\n");
+            return 2;
+        }
+        if (lock_status == 0) {
+            fprintf(stderr,
+                    "moenotes_slidepuzzle: another export is already writing to %s\n"
+                    "  (remove %s/.export.lock if that is stale)\n",
+                    options.out_dir, options.out_dir);
+            return 1;
+        }
     }
 
     /* The PDB is only worth building when a 5x5 board will actually use it. */
@@ -804,8 +875,8 @@ int mnsp_export_command(int argc, char **argv)
 
     /* The index is appended to as boards complete, so clear it first; otherwise a
      * second run would duplicate every row. */
-    if (options.index_path != NULL) {
-        remove(options.index_path);
+    if (options.index_path_used) {
+        remove(options.index_tmp_path);
     }
 
     /* On Linux exceeding a file-size rlimit raises SIGXFSZ, whose default action is to
@@ -869,6 +940,19 @@ int mnsp_export_command(int argc, char **argv)
             "\nexport: %d planned, %d written, %d skipped, %d failed in %.1f s\n",
             planned, written, skipped, failed,
             (export_now_ms() - started) / 1000.0);
+
+    /* Publish the index only now: every board has been attempted and each row in the
+     * temp file corresponds to a board that really exists. */
+    if (options.index_path_used && failed == 0) {
+        if (rename(options.index_tmp_path, options.index_path) != 0) {
+            fprintf(stderr, "moenotes_slidepuzzle: cannot publish the index\n");
+            failed++;
+        }
+    } else if (options.index_path_used) {
+        remove(options.index_tmp_path);
+        fprintf(stderr,
+                "note: the index was discarded because some boards failed\n");
+    }
 
     mnsp_pdb_destroy(pdb);
     release_lock();
