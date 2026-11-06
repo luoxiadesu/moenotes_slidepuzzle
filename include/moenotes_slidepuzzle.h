@@ -145,6 +145,18 @@ int mnsp_pdb_supported(int grid);
  * Release with mnsp_pdb_destroy. */
 mnsp_pdb_t *mnsp_pdb_create(int grid);
 
+/* Same, but caches the tables in `cache_dir` (created by the caller).
+ *
+ * Building costs about 217 s; loading a cached set costs about 0.05 s from page
+ * cache, plus 486 MiB of resident memory either way. This is the difference between
+ * the PDB being a batch-only tool and being usable for a single solve, so prefer this
+ * entry point unless the caller has nowhere to write.
+ *
+ * The cache records the group definitions and the goal layout; a mismatch rebuilds
+ * rather than loading tables that would silently produce a wrong heuristic.
+ * Passing NULL for cache_dir behaves exactly like mnsp_pdb_create. */
+mnsp_pdb_t *mnsp_pdb_create_cached(int grid, const char *cache_dir);
+
 /* Release the tables and the handle. Safe to call with NULL. */
 void mnsp_pdb_destroy(mnsp_pdb_t *pdb);
 

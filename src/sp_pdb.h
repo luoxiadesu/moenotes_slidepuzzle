@@ -27,6 +27,15 @@ int mnsp_pdb_supported(int grid);
 /* Build the tables. Returns NULL on an unsupported size or allocation failure. */
 mnsp_pdb_t *mnsp_pdb_create(int grid);
 
+/* Same, but reads the tables from `cache_dir` when a valid cache is present and
+ * writes them there after building. The cache is keyed to the group definitions and
+ * the goal layout; anything else is rebuilt rather than trusted.
+ *
+ * This is what makes the PDB usable for single-shot solving: building costs about
+ * 217 s, loading from page cache costs about 0.05 s. Pass NULL for cache_dir to
+ * behave exactly like mnsp_pdb_create. */
+mnsp_pdb_t *mnsp_pdb_create_cached(int grid, const char *cache_dir);
+
 /* Release the tables and the handle. Safe on NULL. */
 void mnsp_pdb_destroy(mnsp_pdb_t *pdb);
 

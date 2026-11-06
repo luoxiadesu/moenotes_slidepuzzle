@@ -63,6 +63,12 @@
 #define PDB_ENTRIES (25u * 24u * 23u * 22u * 21u * 20u) /* 127,512,000 */
 #define PDB_UNVISITED 0xFFu
 
+/* Cache format marker. Bump when the group definitions or the goal layout change --
+ * loading a table built for a different layout would make the heuristic inadmissible
+ * silently, which is the one failure mode worth being paranoid about. */
+#define PDB_CACHE_MAGIC 0x4D4E5350u /* "MNSP" */
+#define PDB_CACHE_VERSION 1u
+
 /* One byte per entry is enough: measured maxima per group are 39 / 32 / 31 / 37
  * (lab/range2), so six bits would do losslessly, but unpacking costs more than the
  * 25% memory it saves on a desktop. A WASM build that needs the smaller tables should
@@ -371,4 +377,182 @@ int mnsp_pdb_heuristic(const mnsp_pdb_t *pdb, const int32_t *positions, int grid
     /* Every real tile is covered by exactly one group, so there is no Manhattan
      * residual. That is a property of the 5x5 split, not an approximation. */
     return total;
+}
+
+/* ------------------------------------------------------------------- caching */
+
+/* The tables take about 217 s to build and 486 MiB to hold, so a caller that solves
+ * one board would otherwise pay three and a half minutes for a two-second answer.
+ * Serialising them once and reading them back costs 0.05 s from page cache, which is
+ * what makes the PDB usable for single-shot solving rather than batch work.
+ *
+ * The header pins everything that could silently invalidate the tables: the group
+ * definitions, the goal layout, and the entry count. A mismatch is a hard failure
+ * rather than a partial load, because a stale table produces a heuristic that is
+ * wrong but still looks like a number. */
+
+typedef struct pdb_cache_header {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t grid;
+    uint32_t tiles;
+    uint32_t groups;
+    uint32_t entries;
+    int32_t group_tiles[PDB_GROUPS][PDB_TILES];
+    int32_t goal[PDB_CELLS];
+} pdb_cache_header_t;
+
+static void fill_header(pdb_cache_header_t *header)
+{
+    memset(header, 0, sizeof *header);
+    header->magic = PDB_CACHE_MAGIC;
+    header->version = PDB_CACHE_VERSION;
+    header->grid = PDB_GRID;
+    header->tiles = PDB_TILES;
+    header->groups = PDB_GROUPS;
+    header->entries = PDB_ENTRIES;
+    for (int g = 0; g < PDB_GROUPS; g++) {
+        for (int s = 0; s < PDB_TILES; s++) {
+            header->group_tiles[g][s] = PDB_GROUP_TILES[g][s];
+        }
+    }
+    mnsp_goal_positions(PDB_GRID, header->goal);
+}
+
+static char *cache_path(const char *dir, const char *name, char *buffer, size_t capacity)
+{
+    int written = snprintf(buffer, capacity, "%s/%s", dir, name);
+    if (written <= 0 || (size_t)written >= capacity) {
+        return NULL;
+    }
+    return buffer;
+}
+
+/* Returns a loaded handle, or NULL when the cache is missing, corrupt, or stale.
+ * A NULL here is not an error -- the caller falls back to building. */
+static mnsp_pdb_t *load_cached(const char *dir)
+{
+    char path[1024];
+    pdb_cache_header_t header;
+    pdb_cache_header_t expected;
+    mnsp_pdb_t *pdb;
+    FILE *file;
+
+    if (dir == NULL || cache_path(dir, "meta.bin", path, sizeof path) == NULL) {
+        return NULL;
+    }
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        return NULL;
+    }
+    if (fread(&header, sizeof header, 1, file) != 1) {
+        fclose(file);
+        return NULL;
+    }
+    fclose(file);
+
+    fill_header(&expected);
+    if (memcmp(&header, &expected, sizeof header) != 0) {
+        return NULL; /* different build, different layout: rebuild */
+    }
+
+    pdb = (mnsp_pdb_t *)calloc(1, sizeof *pdb);
+    if (pdb == NULL) {
+        return NULL;
+    }
+    {
+        uint32_t product = 1;
+        for (int i = PDB_TILES - 1; i >= 0; i--) {
+            pdb->divisor[i] = product;
+            product *= (uint32_t)(PDB_CELLS - i);
+        }
+    }
+    for (int g = 0; g < PDB_GROUPS; g++) {
+        char name[32];
+        snprintf(name, sizeof name, "group%d.bin", g);
+        if (cache_path(dir, name, path, sizeof path) == NULL) {
+            mnsp_pdb_destroy(pdb);
+            return NULL;
+        }
+        file = fopen(path, "rb");
+        if (file == NULL) {
+            mnsp_pdb_destroy(pdb);
+            return NULL;
+        }
+        pdb->groups[g].dist = (uint8_t *)malloc(PDB_ENTRIES);
+        if (pdb->groups[g].dist == NULL ||
+            fread(pdb->groups[g].dist, 1, PDB_ENTRIES, file) != PDB_ENTRIES) {
+            fclose(file);
+            mnsp_pdb_destroy(pdb);
+            return NULL;
+        }
+        fclose(file);
+        for (int s = 0; s < PDB_TILES; s++) {
+            pdb->groups[g].tiles[s] = PDB_GROUP_TILES[g][s];
+        }
+    }
+    pdb->ready = 1;
+    return pdb;
+}
+
+static int save_cached(const char *dir, const mnsp_pdb_t *pdb)
+{
+    char path[1024];
+    pdb_cache_header_t header;
+    FILE *file;
+
+    if (dir == NULL) {
+        return 0;
+    }
+    fill_header(&header);
+    if (cache_path(dir, "meta.bin", path, sizeof path) == NULL) {
+        return 0;
+    }
+    file = fopen(path, "wb");
+    if (file == NULL) {
+        return 0;
+    }
+    if (fwrite(&header, sizeof header, 1, file) != 1) {
+        fclose(file);
+        return 0;
+    }
+    fclose(file);
+
+    for (int g = 0; g < PDB_GROUPS; g++) {
+        char name[32];
+        snprintf(name, sizeof name, "group%d.bin", g);
+        if (cache_path(dir, name, path, sizeof path) == NULL) {
+            return 0;
+        }
+        file = fopen(path, "wb");
+        if (file == NULL) {
+            return 0;
+        }
+        if (fwrite(pdb->groups[g].dist, 1, PDB_ENTRIES, file) != PDB_ENTRIES) {
+            fclose(file);
+            return 0;
+        }
+        fclose(file);
+    }
+    return 1;
+}
+
+mnsp_pdb_t *mnsp_pdb_create_cached(int grid, const char *cache_dir)
+{
+    mnsp_pdb_t *pdb;
+
+    if (grid != PDB_GRID) {
+        return NULL;
+    }
+    pdb = load_cached(cache_dir);
+    if (pdb != NULL) {
+        return pdb;
+    }
+    pdb = mnsp_pdb_create(grid);
+    if (pdb != NULL && cache_dir != NULL) {
+        /* A failed save is not fatal: the tables are already built and usable, the
+         * caller just pays the build cost again next time. */
+        (void)save_cached(cache_dir, pdb);
+    }
+    return pdb;
 }
