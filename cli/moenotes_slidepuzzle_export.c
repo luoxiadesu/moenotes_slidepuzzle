@@ -144,6 +144,12 @@ static void sink_printf(export_sink_t *sink, const char *format, ...)
     }
 }
 
+/* 1 when any write to this sink has failed. */
+static int sink_failed(const export_sink_t *sink)
+{
+    return sink->failed;
+}
+
 /* Returns 0 on success. A write error anywhere in the stream is reported here even if
  * the close itself succeeds -- gzclose flushes and may return Z_OK after a failed
  * intermediate write on some zlib builds. */
@@ -185,6 +191,31 @@ static void json_board(export_sink_t *out, const int32_t *positions, int grid)
         sink_printf(out, "]");
     }
     sink_printf(out, "]");
+}
+
+/* Writes s as the inside of a JSON string. The current jacket table only holds
+ * [0-9a-z_], but it is generated from master data, so escaping is cheaper than
+ * trusting the generator's character set forever. */
+static void json_string(export_sink_t *out, const char *s)
+{
+    for (const unsigned char *p = (const unsigned char *)s; *p != '\0'; p++) {
+        switch (*p) {
+        case '"':  sink_printf(out, "\\\""); break;
+        case '\\': sink_printf(out, "\\\\"); break;
+        case '\b': sink_printf(out, "\\b"); break;
+        case '\f': sink_printf(out, "\\f"); break;
+        case '\n': sink_printf(out, "\\n"); break;
+        case '\r': sink_printf(out, "\\r"); break;
+        case '\t': sink_printf(out, "\\t"); break;
+        default:
+            if (*p < 0x20) {
+                sink_printf(out, "\\u%04x", (unsigned)*p);
+            } else {
+                sink_printf(out, "%c", (char)*p);
+            }
+            break;
+        }
+    }
 }
 
 static char move_letter(mnsp_move_t move)
@@ -256,6 +287,9 @@ static int write_steps(export_sink_t *out, const int32_t *initial, int grid,
                  to_row, to_col, from_row, from_col);
         json_board(out, current, grid);
         sink_printf(out, "}\n");
+        if (sink_failed(out)) {
+            return -1; /* stop early; the caller removes the temporary file */
+        }
     }
     return count;
 }
@@ -437,9 +471,13 @@ static int export_board(const export_options_t *options, mnsp_pdb_t *pdb,
 
     sink_printf(out,
              "{\"type\":\"meta\",\"schema\":%d,\"musicId\":%d,\"grid\":%d,"
-             "\"jacket\":\"%s\",\"initial\":",
-             EXPORT_SCHEMA, (int)music_id, grid,
-             mnsp_jacket_asset_name(music_id) ? mnsp_jacket_asset_name(music_id) : "");
+             "\"jacket\":\"",
+             EXPORT_SCHEMA, (int)music_id, grid);
+    {
+        const char *jacket = mnsp_jacket_asset_name(music_id);
+        json_string(out, jacket != NULL ? jacket : "");
+    }
+    sink_printf(out, "\",\"initial\":");
     json_board(out, board, grid);
     sink_printf(out, ",\"goal\":");
     json_board(out, goal, grid);
@@ -740,14 +778,22 @@ int mnsp_export_command(int argc, char **argv)
                 memset(&result, 0, sizeof result);
                 outcome = export_board(&options, pdb, music_id, grid, &result,
                                        error, sizeof error);
-                if (outcome > 0) {
-                    written++;
-                    write_index(&options, music_id, grid, result.moves,
-                                result.solver, result.quality);
-                } else if (outcome == 0) {
-                    skipped++;
-                    write_index(&options, music_id, grid, result.moves,
-                                result.solver, result.quality);
+                if (outcome >= 0) {
+                    if (outcome > 0) {
+                        written++;
+                    } else {
+                        skipped++;
+                    }
+                    /* A board that exported but could not be indexed is still a
+                     * failure: the index is how a consumer discovers the files. */
+                    if (write_index(&options, music_id, grid, result.moves,
+                                    result.solver, result.quality) != 0) {
+                        failed++;
+                        fprintf(stderr,
+                                "  %d %dx%d  index write failed\n",
+                                (int)music_id, grid, grid);
+                        fflush(stderr);
+                    }
                 } else {
                     failed++;
                     fprintf(stderr, "  %d %dx%d  FAILED: %s\n",
