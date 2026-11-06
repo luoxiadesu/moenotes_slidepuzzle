@@ -507,19 +507,60 @@ static int export_board(const export_options_t *options, mnsp_pdb_t *pdb,
         /* The file is already complete, but the index still needs a row. Read the
          * metadata line back so the reported length and solver are the real ones
          * rather than placeholders. */
-        gzFile existing = gzopen(path, "rb");
+        /* Read the provenance back rather than stamping "cached": the index is how a
+         * consumer filters by quality, and overwriting every row with "cached" on a
+         * resume run destroys that information. */
         out_result->moves = -1;
         out_result->solver = "cached";
         out_result->quality = "cached";
-        if (existing != NULL) {
+        {
             char line[8192];
-            if (gzgets(existing, line, sizeof line) != NULL) {
+            int have_line = 0;
+            if (options->compress) {
+                gzFile existing = gzopen(path, "rb");
+                if (existing != NULL) {
+                    have_line = gzgets(existing, line, sizeof line) != NULL;
+                    gzclose(existing);
+                }
+            } else {
+                FILE *existing = fopen(path, "rb");
+                if (existing != NULL) {
+                    have_line = fgets(line, sizeof line, existing) != NULL;
+                    fclose(existing);
+                }
+            }
+            if (have_line) {
                 const char *p = strstr(line, "\"solutionLength\":");
                 if (p != NULL) {
                     out_result->moves = (int)strtol(p + 17, NULL, 10);
                 }
+                p = strstr(line, "\"solver\":\"");
+                if (p != NULL) {
+                    static char solver_buf[64];
+                    size_t n = 0;
+                    p += 10;
+                    while (*p != '"' && *p != '\0' && n + 1 < sizeof solver_buf) {
+                        solver_buf[n++] = *p++;
+                    }
+                    solver_buf[n] = '\0';
+                    if (n > 0) {
+                        out_result->solver = solver_buf;
+                    }
+                }
+                p = strstr(line, "\"quality\":\"");
+                if (p != NULL) {
+                    static char quality_buf[64];
+                    size_t n = 0;
+                    p += 11;
+                    while (*p != '"' && *p != '\0' && n + 1 < sizeof quality_buf) {
+                        quality_buf[n++] = *p++;
+                    }
+                    quality_buf[n] = '\0';
+                    if (n > 0) {
+                        out_result->quality = quality_buf;
+                    }
+                }
             }
-            gzclose(existing);
         }
         return 0;
     }
@@ -590,6 +631,62 @@ static int export_board(const export_options_t *options, mnsp_pdb_t *pdb,
 }
 
 /* -------------------------------------------------------------------- index */
+
+/* Copies the current index into the temp file, dropping any row for a board that this
+ * run is about to regenerate. Without this a selective `--resume --music X` would
+ * leave the index describing only X. */
+static void seed_index_from_existing(const export_options_t *options)
+{
+    char line[4096];
+    export_sink_t *out;
+    int have_source = 0;
+
+    if (!options->index_path_used) {
+        return;
+    }
+    out = sink_open_append(options->index_tmp_path, options->compress);
+    if (out == NULL) {
+        return;
+    }
+    {
+        FILE *source = NULL;
+        gzFile gz_source = NULL;
+        if (options->compress) {
+            gz_source = gzopen(options->index_path, "rb");
+            have_source = gz_source != NULL;
+        } else {
+            source = fopen(options->index_path, "rb");
+            have_source = source != NULL;
+        }
+        if (have_source) {
+            while ((options->compress ? gzgets(gz_source, line, sizeof line)
+                                      : fgets(line, sizeof line, source)) != NULL) {
+                long music = -1, grid = -1;
+                const char *p = strstr(line, "\"musicId\":");
+                int regenerate = 0;
+                if (p != NULL) music = strtol(p + 10, NULL, 10);
+                p = strstr(line, "\"grid\":");
+                if (p != NULL) grid = strtol(p + 7, NULL, 10);
+                /* Only keep rows this run is not going to rewrite. */
+                for (int k = 0; k < options->music_count && !regenerate; k++) {
+                    if (options->music[k] == (int32_t)music &&
+                        options->grids[(int)grid]) {
+                        regenerate = 1;
+                    }
+                }
+                if (options->music_count == 0 && options->grids[(int)grid]) {
+                    regenerate = 1;
+                }
+                if (!regenerate) {
+                    sink_printf(out, "%s", line);
+                }
+            }
+        }
+        if (gz_source != NULL) gzclose(gz_source);
+        if (source != NULL) fclose(source);
+    }
+    sink_close(out);
+}
 
 /* Appends one row per board.
  *
@@ -877,6 +974,12 @@ int mnsp_export_command(int argc, char **argv)
      * second run would duplicate every row. */
     if (options.index_path_used) {
         remove(options.index_tmp_path);
+        /* --resume means "continue", so the rows for boards this run did not touch
+         * have to survive. Seed the temp file with the existing index first, then the
+         * rows written below replace their own (musicId, grid) entries. */
+        if (options.resume) {
+            seed_index_from_existing(&options);
+        }
     }
 
     /* On Linux exceeding a file-size rlimit raises SIGXFSZ, whose default action is to
