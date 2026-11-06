@@ -38,6 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <signal.h>
 #include <unistd.h>
 #include <time.h>
 #include <zlib.h>
@@ -89,6 +90,7 @@ static double export_now_ms(void)
 typedef struct export_sink {
     gzFile gz;
     FILE *plain;
+    int failed;   /* sticky: set once any write reports an error */
 } export_sink_t;
 
 static export_sink_t *sink_open(const char *path, int compress)
@@ -113,26 +115,44 @@ static export_sink_t *sink_open(const char *path, int compress)
     return sink;
 }
 
+/* A short write here means the file is wrong, not merely slow: gzip streams cannot be
+ * resumed, and a truncated JSONL parses up to the cut and then stops, which is the kind
+ * of failure a consumer notices only when replaying the last few steps. The error is
+ * sticky so a single failed line is not lost among thousands of successful ones. */
 static void sink_printf(export_sink_t *sink, const char *format, ...)
 {
     va_list args;
+    int written;
+
+    if (sink->failed) {
+        return;
+    }
     va_start(args, format);
     if (sink->gz != NULL) {
-        gzvprintf(sink->gz, format, args);
+        written = gzvprintf(sink->gz, format, args);
     } else {
-        vfprintf(sink->plain, format, args);
+        written = vfprintf(sink->plain, format, args);
     }
     va_end(args);
+    if (written < 0) {
+        sink->failed = 1;
+    }
 }
 
-/* Returns 0 on success. */
+/* Returns 0 on success. A write error anywhere in the stream is reported here even if
+ * the close itself succeeds -- gzclose flushes and may return Z_OK after a failed
+ * intermediate write on some zlib builds. */
 static int sink_close(export_sink_t *sink)
 {
-    int status = 0;
+    int status = sink->failed ? -1 : 0;
     if (sink->gz != NULL) {
-        status = gzclose(sink->gz) == Z_OK ? 0 : -1;
+        if (gzclose(sink->gz) != Z_OK) {
+            status = -1;
+        }
     } else if (sink->plain != NULL) {
-        status = fclose(sink->plain) == 0 ? 0 : -1;
+        if (fclose(sink->plain) != 0) {
+            status = -1;
+        }
     }
     free(sink);
     return status;
@@ -545,10 +565,28 @@ static int parse_args(int argc, char **argv, export_options_t *options)
             options->any_grid = 1;
         } else if (strcmp(argv[i], "--music") == 0 && i + 1 < argc) {
             long value = strtol(argv[++i], NULL, 10);
+            int duplicate = 0;
             if (value <= 0 || options->music_count >= 256) {
                 return -1;
             }
-            options->music[options->music_count++] = (int32_t)value;
+            /* A song id the game does not ship would still generate a board -- the id
+             * only seeds the shuffle -- but the result is a puzzle nobody can see, with
+             * an empty jacket name. Refuse rather than emit it. */
+            if (mnsp_jacket_asset_name((int32_t)value) == NULL) {
+                fprintf(stderr,
+                        "moenotes_slidepuzzle: %ld is not a built-in song; "
+                        "run `list-jackets` for the ids this build knows\n", value);
+                return -2; /* bad value, but the syntax was fine: no usage dump */
+            }
+            for (int k = 0; k < options->music_count; k++) {
+                if (options->music[k] == (int32_t)value) {
+                    duplicate = 1;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                options->music[options->music_count++] = (int32_t)value;
+            }
         } else if (strcmp(argv[i], "--strategy") == 0 && i + 1 < argc) {
             const char *name = argv[++i];
             if (strcmp(name, "auto") == 0) {
@@ -601,6 +639,9 @@ int mnsp_export_command(int argc, char **argv)
     if (parsed == 1) {
         return 0;
     }
+    if (parsed == -2) {
+        return 2;
+    }
     if (parsed < 0) {
         export_usage(stderr);
         return 2;
@@ -652,6 +693,14 @@ int mnsp_export_command(int argc, char **argv)
     if (options.index_path != NULL) {
         remove(options.index_path);
     }
+
+    /* On Linux exceeding a file-size rlimit raises SIGXFSZ, whose default action is to
+     * kill the process -- the write never returns, so the sink never sees an error and
+     * a truncated .tmp (plus the lock) is left behind. Ignoring the signal makes write()
+     * return EFBIG instead, which the sink reports as an ordinary failure. */
+#ifdef SIGXFSZ
+    signal(SIGXFSZ, SIG_IGN);
+#endif
 
     started = export_now_ms();
     {

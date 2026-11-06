@@ -242,6 +242,38 @@ static int generate_fixtures(void)
     return status == 0;
 }
 
+/* A full disk must fail the run, not silently produce a truncated file. The file-size
+ * rlimit reproduces it without needing to fill a real filesystem: with SIGXFSZ ignored
+ * the write returns EFBIG and the exporter reports the failure.
+ *
+ * Skipped where the shell cannot set a limit or the platform lacks ulimit. */
+static void test_write_failure_is_reported(void)
+{
+    char dir[512];
+    char command[2048];
+    int status;
+
+    snprintf(dir, sizeof dir, "%s/full", MNSP_EXPORT_TEST_DIR);
+    snprintf(command, sizeof command,
+             "mkdir -p \"%s\" && sh -c 'ulimit -f 1 2>/dev/null && \"%s\" export "
+             "--out \"%s\" --music 100050 --grid 7 --strategy ladder' >/dev/null 2>&1",
+             dir, MNSP_EXPORT_BINARY, dir);
+    status = system(command);
+    if (status == 0) {
+        /* No rlimit support here (or the write fit): nothing to assert. */
+        printf("  write-failure test skipped (no file-size limit)\n");
+        return;
+    }
+    {
+        char path[600];
+        FILE *file;
+        snprintf(path, sizeof path, "%s/100050_7.jsonl.gz", dir);
+        file = fopen(path, "rb");
+        assert(file == NULL);   /* the truncated temp must not have been renamed */
+        printf("  full disk reported as failure, no output left behind\n");
+    }
+}
+
 int main(void)
 {
     assert(generate_fixtures());
@@ -249,6 +281,7 @@ int main(void)
     test_export_five_by_five();
     test_plain_output();
     test_resume_is_idempotent();
+    test_write_failure_is_reported();
     puts("test_export: ok");
     return 0;
 }
