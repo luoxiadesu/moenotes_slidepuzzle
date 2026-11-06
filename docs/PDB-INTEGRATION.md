@@ -264,3 +264,83 @@ PDB 的收益只集中在 5×5 —— 3×3/4×4 的 A\* 已是精确最优，6×
 
 这是本轮第四次「挑选样本不代表整体」的教训（前三次：合成 ID、单盘面代表
 尺寸、3 首代表 20 首）。
+
+## 离线生成器：`export` 子命令
+
+`moenotes_slidepuzzle export` 一次性求解所有 (歌曲, 尺寸) 盘面，把完整路径写盘，
+供下游直接读取而不再求解。这翻转了成本模型：生成器可以在一盘上花几分钟，
+因为结果会被永久缓存。
+
+### 输出
+
+每盘一个 gzip 的 JSONL：`<out>/<musicId>_<grid>.jsonl.gz`
+
+第一行元数据，之后每行一步，**每步带完整二维盘面**（屏幕序，行 0 在顶部）：
+
+```json
+{"type":"meta","schema":1,"musicId":100050,"grid":3,"jacket":"jkt_003_100050",
+ "initial":[[0,3,6],[8,4,7],[1,-1,5]],"goal":[[6,7,8],[3,4,5],[0,1,-1]],
+ "solutionLength":15,"solver":"exact-astar","quality":"optimal","elapsedMs":0}
+{"type":"step","index":1,"move":"U","tile":4,"from":[1,1],"to":[2,1],
+ "board":[[0,3,6],[8,-1,7],[1,4,5]]}
+```
+
+- `board` 可直接渲染，无需了解内部坐标翻转
+- `move` 是空格的方向；`from`/`to` 是**被滑动 tile** 的屏幕坐标
+- `solver` / `quality` 记录这一盘实际走的路径，下游可据此判断可信度
+
+### 策略分派
+
+| 尺寸 | 策略 | quality |
+|---|---|---|
+| 3×3、4×4 | A\* 精确 | `optimal` |
+| 5×5 | PDB w=1.5，失败回退 A\* | `near-optimal` / `heuristic` |
+| 6×6–8×8 | A\* 权重阶梯 | `heuristic` |
+
+5×5 的 PDB 表缓存在 `$XDG_CACHE_HOME/moenotes-slidepuzzle/pdb-5`
+（默认 `~/.cache/...`），与封面缓存同一棵树；第二次运行起加载约 0.05 秒。
+
+### 实测
+
+| 范围 | 盘面数 | 耗时 | 体积 |
+|---|---|---|---|
+| 3×3 + 4×4 + 5×5（ladder） | 252 | **9.2 秒** | — |
+| **3×3 … 7×7（auto，含 PDB）** | **420** | **355 秒（5.9 分钟）** | **2.1 MiB** |
+| 全部含 8×8 | 504 | 约 39 分钟 | 约 0.9–3 MiB |
+
+420 盘面全部成功，零失败、零跳过。耗时与「3×3–7×7 约 5 分钟」的预估吻合。
+
+gzip 后全量约 **0.9 MiB**（原始 JSONL 约 18.6 MiB，压缩率 20 倍）。
+
+**PDB 缓存效果实测**：首次运行建表 217 秒；第二次运行整个导出 **0.184 秒**
+（加载 486 MiB 表 + 求解 1 盘）。缓存落在
+`$XDG_CACHE_HOME/moenotes-slidepuzzle/pdb-5`，与封面缓存同树。
+
+**策略分派验证**（同一次批量里的实际标注）：
+
+```
+100003 3x3  19 moves  exact-astar (optimal, 0 ms)
+100003 4x4  42 moves  exact-astar (optimal, 24 ms)
+100003 5x5  73 moves  pdb-w1.5   (near-optimal, 123 ms)
+100003 6x6 140 moves  ladder     (heuristic, 70 ms)
+100003 7x7 227 moves  ladder     (heuristic, 38 ms)
+```
+
+5×5 的 PDB 路径实测比 ladder 短：100050 是 **57 步对 69 步（−17%）**。
+
+### 选项
+
+```
+--out <dir>        输出目录（默认 ./puzzles）
+--grid <N>         只做该尺寸，可重复
+--music <id>       只做该歌曲，可重复
+--strategy <s>     auto | exact | pdb | ladder
+--resume           跳过已完整的输出文件
+--no-compress      输出纯 JSONL
+--index            维护 <out>/index.jsonl.gz
+```
+
+### 依赖说明
+
+导出功能需要 zlib，**仅链接进 CLI**。库本身（`moenotes::slidepuzzle`）仍然
+零第三方依赖，下游使用库不受影响。
