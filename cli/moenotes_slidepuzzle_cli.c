@@ -10,6 +10,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Implemented in moenotes_slidepuzzle_export.c: batch generation of every board. */
+int mnsp_export_command(int argc, char **argv);
+
 static void usage(FILE *out)
 {
     fputs("usage: moenotes_slidepuzzle <command> [options]\n"
@@ -35,6 +38,9 @@ static void usage(FILE *out)
           "  fetch-jackets [--region tw] [--locale zh-Hant] [--base URL] [--limit N]\n"
           "                              download cover art into the local cache\n"
           "  list-jackets              print the built-in song -> jacket table\n"
+          "  export --out <dir> [--grid N] [--music id] [--resume] [--index]\n"
+          "                              solve every board and write step-by-step JSONL\n"
+          "                              (gzip) for downstream replay; see export --help\n"
           "  --help, --version\n"
           "\n"
           "The grid is the puzzle size the game offers: 3..8.\n"
@@ -557,6 +563,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "list-jackets") == 0) {
         return command_list_jackets();
+    }
+    if (strcmp(argv[1], "export") == 0) {
+        return mnsp_export_command(argc, argv);
     }
     if (strcmp(argv[1], "read-music") == 0) {
         int code = command_read_music(argc, argv);

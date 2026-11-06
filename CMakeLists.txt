@@ -36,8 +36,16 @@ else()
 endif()
 
 if(MOENOTES_BUILD_CLI)
-    add_executable(moenotes_slidepuzzle_cli cli/moenotes_slidepuzzle_cli.c)
+    add_executable(moenotes_slidepuzzle_cli
+        cli/moenotes_slidepuzzle_cli.c
+        cli/moenotes_slidepuzzle_export.c)
     target_link_libraries(moenotes_slidepuzzle_cli PRIVATE moenotes_slidepuzzle)
+    # The batch exporter writes gzip'd JSONL. This is the only third-party dependency
+    # in the project and it is confined to the CLI: the library itself stays
+    # dependency-free, so downstream users of moenotes::slidepuzzle are unaffected.
+    find_package(ZLIB REQUIRED)
+    target_link_libraries(moenotes_slidepuzzle_cli PRIVATE ZLIB::ZLIB)
+    target_include_directories(moenotes_slidepuzzle_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     set_target_properties(moenotes_slidepuzzle_cli PROPERTIES OUTPUT_NAME moenotes_slidepuzzle)
     if(NOT MSVC)
         target_compile_options(moenotes_slidepuzzle_cli PRIVATE -Wall -Wextra -Wpedantic)
@@ -66,5 +74,17 @@ if(MOENOTES_BUILD_TESTS)
     if(MOENOTES_BUILD_CLI)
         add_test(NAME cli_version COMMAND moenotes_slidepuzzle_cli --version)
         set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION "moenotes_slidepuzzle 0\\.1\\.0")
+
+        # The exporter is a file producer, so its test drives the real binary and then
+        # reads what it wrote. It needs zlib to read the gzip'd output back.
+        add_executable(test_export tests/test_export.c)
+        target_link_libraries(test_export PRIVATE moenotes_slidepuzzle ZLIB::ZLIB)
+        target_compile_definitions(test_export PRIVATE
+            MNSP_EXPORT_TEST_DIR="${CMAKE_CURRENT_BINARY_DIR}/test-export"
+            MNSP_EXPORT_BINARY="$<TARGET_FILE:moenotes_slidepuzzle_cli>")
+        if(NOT MSVC)
+            target_compile_options(test_export PRIVATE -UNDEBUG)
+        endif()
+        add_test(NAME export COMMAND test_export)
     endif()
 endif()
