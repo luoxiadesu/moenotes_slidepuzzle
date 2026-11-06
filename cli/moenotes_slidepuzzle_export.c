@@ -38,6 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <time.h>
 #include <zlib.h>
 
@@ -437,6 +438,9 @@ static int export_board(const export_options_t *options, mnsp_pdb_t *pdb,
     fprintf(stderr, "  %d %dx%d  %d moves  %s (%s, %.0f ms)\n",
             (int)music_id, grid, grid, count, result.solver, result.quality,
             result.elapsed_ms);
+    /* stderr is unbuffered on a terminal but block-buffered when redirected to a file,
+     * so a long batch appears to hang without this. */
+    fflush(stderr);
     *out_result = result;
     return 1; /* 1 = written, 0 = skipped, -1 = failed */
 }
@@ -466,6 +470,33 @@ static int write_index(const export_options_t *options, int32_t music_id, int gr
 
 /* --------------------------------------------------------------------- main */
 
+/* A run lock, so two exports writing into the same directory fail loudly instead of
+ * interleaving. The rename-based write is atomic per file, but two runs would still
+ * duplicate gzip index appends and waste the PDB build. */
+static char g_lock_path[1024];
+
+static int acquire_lock(const char *dir)
+{
+    FILE *file;
+    snprintf(g_lock_path, sizeof g_lock_path, "%s/.export.lock", dir);
+    /* "wx" fails when the file already exists, which is exactly the check we want. */
+    file = fopen(g_lock_path, "wx");
+    if (file == NULL) {
+        return 0;
+    }
+    fprintf(file, "%ld\n", (long)getpid());
+    fclose(file);
+    return 1;
+}
+
+static void release_lock(void)
+{
+    if (g_lock_path[0] != '\0') {
+        remove(g_lock_path);
+        g_lock_path[0] = '\0';
+    }
+}
+
 static void export_usage(FILE *out)
 {
     fputs("usage: moenotes_slidepuzzle export --out <dir> [options]\n"
@@ -480,8 +511,13 @@ static void export_usage(FILE *out)
           "  --grid <N>         only this size; repeatable (default 3..8)\n"
           "  --music <id>       only this song; repeatable (default every built-in song)\n"
           "  --strategy <s>     auto (default) | exact | pdb | ladder\n"
-          "                       auto: exact below 5x5, PDB at 5x5, ladder above\n"
-          "                       exact: try a provably shortest path at 5x5 (slow)\n"
+          "                       auto:  exact below 5x5, PDB at 5x5, ladder above\n"
+          "                       exact: try a provably shortest path at 5x5 (may take\n"
+          "                              minutes per board, falls back when it gives up)\n"
+          "                       pdb:   force the 5x5 pattern-database search\n"
+          "                       ladder: force the shipped weighted search everywhere\n"
+          "                     every strategy falls back rather than failing, so the\n"
+          "                     export always covers all boards\n"
           "  --resume           skip boards whose output file is already complete\n"
           "  --no-compress      write plain .jsonl instead of .jsonl.gz\n"
           "  --index            also maintain <out>/index.jsonl.gz\n"
@@ -573,6 +609,13 @@ int mnsp_export_command(int argc, char **argv)
         fprintf(stderr, "moenotes_slidepuzzle: cannot create %s\n", options.out_dir);
         return 1;
     }
+    if (!acquire_lock(options.out_dir)) {
+        fprintf(stderr,
+                "moenotes_slidepuzzle: another export is already writing to %s\n"
+                "  (remove %s/.export.lock if that is stale)\n",
+                options.out_dir, options.out_dir);
+        return 1;
+    }
 
     /* The PDB is only worth building when a 5x5 board will actually use it. */
     need_pdb = options.grids[5] && options.strategy != EXPORT_LADDER;
@@ -645,6 +688,7 @@ int mnsp_export_command(int argc, char **argv)
                     failed++;
                     fprintf(stderr, "  %d %dx%d  FAILED: %s\n",
                             (int)music_id, grid, grid, error);
+                    fflush(stderr);
                 }
             }
         }
@@ -656,5 +700,6 @@ int mnsp_export_command(int argc, char **argv)
             (export_now_ms() - started) / 1000.0);
 
     mnsp_pdb_destroy(pdb);
+    release_lock();
     return failed == 0 ? 0 : 1;
 }
