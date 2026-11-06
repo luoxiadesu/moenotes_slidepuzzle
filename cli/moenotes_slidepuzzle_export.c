@@ -326,6 +326,9 @@ static int solve_one(mnsp_pdb_t *pdb, const int32_t *board, int grid,
     result->quality = "heuristic";
 
     if (grid <= 4) {
+        /* Exact A* is both faster and provably optimal here, so --strategy cannot
+         * improve on it. It is not silently ignored: the help says ladder applies
+         * "from 5x5 up". */
         count = mnsp_solve_best(board, grid, moves, capacity, mnsp_default_budget(grid));
         result->solver = "exact-astar";
         result->quality = "optimal";
@@ -780,7 +783,8 @@ static void export_usage(FILE *out)
           "                       exact: try a provably shortest path at 5x5 (may take\n"
           "                              minutes per board, falls back when it gives up)\n"
           "                       pdb:   force the 5x5 pattern-database search\n"
-          "                       ladder: force the shipped weighted search everywhere\n"
+          "                       ladder: force the shipped weighted search (5x5 and up;\n"
+          "                               below that exact A* is already optimal and faster)\n"
           "                     every strategy falls back rather than failing, so the\n"
           "                     export always covers all boards\n"
           "  --resume           skip boards whose output file is already complete\n"
