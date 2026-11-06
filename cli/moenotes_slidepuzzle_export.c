@@ -98,26 +98,37 @@ typedef struct export_sink {
     int failed;   /* sticky: set once any write reports an error */
 } export_sink_t;
 
-static export_sink_t *sink_open(const char *path, int compress)
+static export_sink_t *sink_open_mode(const char *path, int compress, const char *mode)
 {
     export_sink_t *sink = (export_sink_t *)calloc(1, sizeof *sink);
     if (sink == NULL) {
         return NULL;
     }
     if (compress) {
-        sink->gz = gzopen(path, "wb6");
+        sink->gz = gzopen(path, mode);
         if (sink->gz == NULL) {
             free(sink);
             return NULL;
         }
     } else {
-        sink->plain = fopen(path, "wb");
+        /* gzopen's "a6" maps to fopen("ab"); the plain path must match. */
+        sink->plain = fopen(path, strchr(mode, 'a') != NULL ? "ab" : "wb");
         if (sink->plain == NULL) {
             free(sink);
             return NULL;
         }
     }
     return sink;
+}
+
+static export_sink_t *sink_open(const char *path, int compress)
+{
+    return sink_open_mode(path, compress, "wb6");
+}
+
+static export_sink_t *sink_open_append(const char *path, int compress)
+{
+    return sink_open_mode(path, compress, "ab6");
 }
 
 /* A short write here means the file is wrong, not merely slow: gzip streams cannot be
@@ -380,34 +391,60 @@ static void build_path(char *buffer, size_t capacity, const char *dir,
 static int cache_is_valid(const char *path, int compress)
 {
     char line[512];
-    FILE *file;
     int ok = 0;
 
-    file = fopen(path, "rb");
-    if (file == NULL) {
-        return 0;
-    }
     if (compress) {
-        /* Cheap check: gzip magic plus a non-trivial size. A full validation would mean
-         * decompressing the file, which costs as much as rewriting it. */
-        unsigned char magic[2];
-        fclose(file);
-        file = fopen(path, "rb");
-        if (file != NULL && fread(magic, 1, 2, file) == 2) {
-            struct stat info;
-            ok = magic[0] == 0x1f && magic[1] == 0x8b &&
-                 stat(path, &info) == 0 && info.st_size > 64;
+        gzFile file = gzopen(path, "rb");
+        if (file == NULL) {
+            return 0;
         }
-        if (file != NULL) {
-            fclose(file);
+        /* A truncation test is not enough: a .gz cut in half still starts with the
+         * magic bytes, and --resume would then skip a file that no reader can open.
+         * Reading to EOF makes zlib verify the trailer and report Z_DATA_ERROR or a
+         * short read on a damaged stream. The cost is one pass over a file that is
+         * already in the page cache, which is far cheaper than re-solving the board. */
+        if (gzgets(file, line, sizeof line) != NULL) {
+            int header_ok = strstr(line, "\"schema\":") != NULL;
+            char scratch[8192];
+            int read_error = 0;
+            while (gzgets(file, scratch, sizeof scratch) != NULL) {
+                /* drain */
+            }
+            /* gzerror returns a string, not the code; the code comes through the
+             * int* out-parameter. Passing NULL there and comparing the string was
+             * wrong and made every complete file look damaged. */
+            {
+                int error_code = 0;
+                (void)gzerror(file, &error_code);
+                if (gzeof(file) && error_code == Z_OK && header_ok) {
+                    ok = 1;
+                }
+            }
+            (void)read_error;
         }
+        gzclose(file);
         return ok;
     }
-    if (fgets(line, sizeof line, file) != NULL) {
-        ok = strstr(line, "\"schema\":") != NULL;
+    {
+        FILE *file = fopen(path, "rb");
+        if (file == NULL) {
+            return 0;
+        }
+        if (fgets(line, sizeof line, file) != NULL) {
+            ok = strstr(line, "\"schema\":") != NULL;
+        }
+        /* Plain mode: a truncated file has no trailing newline on its last line, but
+         * checking that reliably means reading to EOF too. Do it for symmetry. */
+        if (ok) {
+            char scratch[8192];
+            while (fgets(scratch, sizeof scratch, file) != NULL) {
+                /* drain */
+            }
+            ok = feof(file) != 0 && ferror(file) == 0;
+        }
+        fclose(file);
+        return ok;
     }
-    fclose(file);
-    return ok;
 }
 
 /* ------------------------------------------------------------------ export */
@@ -516,25 +553,36 @@ static int export_board(const export_options_t *options, mnsp_pdb_t *pdb,
 
 /* -------------------------------------------------------------------- index */
 
+/* Appends one row per board.
+ *
+ * This open-per-row design is deliberate: the index is written as boards complete, so a
+ * run that is interrupted still leaves an index covering everything written so far.
+ * Opening in "ab" mode appends atomically enough for a single process; the run lock
+ * keeps a second process out.
+ *
+ * The sink is used rather than a bare gzFile so --no-compress produces a plain text
+ * index. It previously always compressed, which produced a file named index.jsonl
+ * containing gzip bytes. */
 static int write_index(const export_options_t *options, int32_t music_id, int grid,
                        int solution_length, const char *solver, const char *quality)
 {
-    gzFile index;
+    export_sink_t *index;
+    int status;
 
     if (options->index_path == NULL) {
         return 0;
     }
-    index = gzopen(options->index_path, "ab6");
+    index = sink_open_append(options->index_path, options->compress);
     if (index == NULL) {
         return -1;
     }
-    gzprintf(index,
-             "{\"musicId\":%d,\"grid\":%d,\"file\":\"%d_%d.jsonl%s\","
-             "\"solutionLength\":%d,\"solver\":\"%s\",\"quality\":\"%s\"}\n",
-             (int)music_id, grid, (int)music_id, grid,
-             options->compress ? ".gz" : "", solution_length, solver, quality);
-    gzclose(index);
-    return 0;
+    sink_printf(index,
+                "{\"musicId\":%d,\"grid\":%d,\"file\":\"%d_%d.jsonl%s\","
+                "\"solutionLength\":%d,\"solver\":\"%s\",\"quality\":\"%s\"}\n",
+                (int)music_id, grid, (int)music_id, grid,
+                options->compress ? ".gz" : "", solution_length, solver, quality);
+    status = sink_close(index);
+    return status;
 }
 
 /* --------------------------------------------------------------------- main */
@@ -610,17 +658,30 @@ static int parse_args(int argc, char **argv, export_options_t *options)
         if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
             options->out_dir = argv[++i];
         } else if (strcmp(argv[i], "--grid") == 0 && i + 1 < argc) {
-            long value = strtol(argv[++i], NULL, 10);
-            if (value < MNSP_MIN_GRID || value > MNSP_MAX_GRID) {
-                return -1;
+            char *end = NULL;
+            long value = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' ||
+                value < MNSP_MIN_GRID || value > MNSP_MAX_GRID) {
+                fprintf(stderr,
+                        "moenotes_slidepuzzle: --grid needs a number %d..%d, got \"%s\"\n",
+                        MNSP_MIN_GRID, MNSP_MAX_GRID, argv[i]);
+                return -2;
             }
             options->grids[value] = 1;
             options->any_grid = 1;
         } else if (strcmp(argv[i], "--music") == 0 && i + 1 < argc) {
-            long value = strtol(argv[++i], NULL, 10);
+            char *end = NULL;
+            long value;
             int duplicate = 0;
-            if (value <= 0 || options->music_count >= 256) {
-                return -1;
+            /* strtol alone accepts "100001x" as 100001, silently exporting a board
+             * for a number the user did not type. Require the whole argument. */
+            value = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value <= 0 ||
+                options->music_count >= 256) {
+                fprintf(stderr,
+                        "moenotes_slidepuzzle: --music needs a numeric song id, got \"%s\"\n",
+                        argv[i]);
+                return -2;
             }
             /* A song id the game does not ship would still generate a board -- the id
              * only seeds the shuffle -- but the result is a puzzle nobody can see, with

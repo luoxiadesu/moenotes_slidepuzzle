@@ -252,6 +252,78 @@ static int generate_fixtures(void)
     return status == 0;
 }
 
+/* --no-compress must produce a readable plain-text index, not gzip bytes behind a
+ * .jsonl name. */
+static void test_plain_index_is_not_gzip(void)
+{
+    char dir[512];
+    char path[600];
+    char command[1024];
+    FILE *file;
+    unsigned char head[2];
+
+    snprintf(dir, sizeof dir, "%s/plainindex", MNSP_EXPORT_TEST_DIR);
+    snprintf(path, sizeof path, "%s/index.jsonl", dir);
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --music 100001 --grid 3 --no-compress "
+             "--index >/dev/null 2>&1", MNSP_EXPORT_BINARY, dir);
+    assert(system(command) == 0);
+
+    file = fopen(path, "rb");
+    assert(file != NULL);
+    assert(fread(head, 1, 2, file) == 2);
+    fclose(file);
+    assert(!(head[0] == 0x1f && head[1] == 0x8b));
+    printf("  --no-compress index is plain text\n");
+}
+
+/* A truncated .gz still begins with the magic bytes; --resume must not accept it. */
+static void test_resume_rebuilds_truncated_gzip(void)
+{
+    char dir[512];
+    char path[600];
+    char command[1024];
+    struct stat before, after;
+
+    snprintf(dir, sizeof dir, "%s/truncated", MNSP_EXPORT_TEST_DIR);
+    snprintf(path, sizeof path, "%s/100050_7.jsonl.gz", dir);
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --music 100050 --grid 7 --strategy ladder "
+             ">/dev/null 2>&1", MNSP_EXPORT_BINARY, dir);
+    assert(system(command) == 0);
+    assert(stat(path, &before) == 0);
+
+    snprintf(command, sizeof command, "truncate -s 500 \"%s\"", path);
+    assert(system(command) == 0);
+
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --music 100050 --grid 7 --strategy ladder "
+             "--resume >/dev/null 2>&1", MNSP_EXPORT_BINARY, dir);
+    assert(system(command) == 0);
+    assert(stat(path, &after) == 0);
+    assert(after.st_size == before.st_size);   /* rebuilt, not left at 500 */
+    printf("  --resume rebuilt a truncated gzip\n");
+}
+
+/* Numeric options must reject trailing garbage rather than parsing a prefix. */
+static void test_numeric_options_are_strict(void)
+{
+    char command[1024];
+    char dir[512];
+
+    snprintf(dir, sizeof dir, "%s/strict", MNSP_EXPORT_TEST_DIR);
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --music 100001x --grid 3 >/dev/null 2>&1",
+             MNSP_EXPORT_BINARY, dir);
+    assert(system(command) != 0);
+
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --grid 3x >/dev/null 2>&1",
+             MNSP_EXPORT_BINARY, dir);
+    assert(system(command) != 0);
+    printf("  trailing garbage rejected\n");
+}
+
 /* A full disk must fail the run, not silently produce a truncated file. The file-size
  * rlimit reproduces it without needing to fill a real filesystem: with SIGXFSZ ignored
  * the write returns EFBIG and the exporter reports the failure.
@@ -295,6 +367,9 @@ int main(void)
     test_export_five_by_five();
     test_plain_output();
     test_resume_is_idempotent();
+    test_plain_index_is_not_gzip();
+    test_resume_rebuilds_truncated_gzip();
+    test_numeric_options_are_strict();
     test_write_failure_is_reported();
     puts("test_export: ok");
     return 0;
