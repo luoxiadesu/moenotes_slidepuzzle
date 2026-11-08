@@ -1,0 +1,4 @@
+{"type":"meta","schema":1,"musicId":100053,"grid":3,"jacket":"jkt_003_100053","initial":[[6,7,8],[-1,4,5],[3,0,1]],"goal":[[6,7,8],[3,4,5],[0,1,-1]],"solutionLength":3,"solver":"exact-astar","quality":"optimal","elapsedMs":0}
+{"type":"step","index":1,"move":"D","tile":3,"from":[2,0],"to":[1,0],"board":[[6,7,8],[3,4,5],[-1,0,1]]}
+{"type":"step","index":2,"move":"R","tile":0,"from":[2,1],"to":[2,0],"board":[[6,7,8],[3,4,5],[0,-1,1]]}
+{"type":"step","index":3,"move":"R","tile":1,"from":[2,2],"to":[2,1],"board":[[6,7,8],[3,4,5],[0,1,-1]]}
