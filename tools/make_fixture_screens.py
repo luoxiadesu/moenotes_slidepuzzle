@@ -96,19 +96,20 @@ def compose_screenshot(jacket, positions, grid, width=1080, height=2400,
     margin = (width - board_w) // 2
     img[top - 50:top + board_w + 50, margin - 50:margin + board_w + 50] = 0.02
 
-    for y in range(grid):
+    # `positions` is already in screen order (index 0 is the top-left cell as drawn),
+    # which is what sp_match_positions emits and what the game shows. The jacket is
+    # stored top-down, so the slice for a tile is taken from the mirrored row -- that
+    # flip is inside the crop, not in the board layout.
+    for row in range(grid):
+        oy = top + row * (cell + gap)
         for x in range(grid):
-            value = positions[y * grid + x]
-            oy = top + (grid - 1 - y) * (cell + gap)
+            value = positions[row * grid + x]
             ox = margin + x * (cell + gap)
             if value < 0:
                 img[oy:oy + cell, ox:ox + cell] = 0.10   # empty slot
                 continue
             cx, cy = value % grid, value // grid
             h, w = jacket.shape[:2]
-            # `value` is a tile id = the position the tile belongs in, with y counted
-            # from the bottom. Screen row r therefore shows the tile whose correct
-            # row is grid-1-r, i.e. image row = grid-1-cy.
             slice_row = grid - 1 - cy
             crop = jacket[slice_row * h // grid:(slice_row + 1) * h // grid,
                           cx * w // grid:(cx + 1) * w // grid]
@@ -145,13 +146,14 @@ def main(argv):
     positions = generate_positions(music_id, grid)
     shot = degrade(compose_screenshot(jacket, positions, grid))
     Image.fromarray((shot * 255).astype(np.uint8)).save(out)
-    # The sidecar records the board in the same order the reader emits: screen order,
-    # row 0 at the top.
-    screen_order = [(grid - 1 - r) * grid + c for r in range(grid) for c in range(grid)]
-    recorded = [positions[i] for i in screen_order]
+    # The sidecar records the board in the same order the reader emits. Both are screen
+    # order (row 0 at the top), which is what generate_positions already produces and
+    # what compose_screenshot draws, so nothing is re-indexed here. An earlier version
+    # flipped it, which made the fixture and the reader agree with each other and
+    # disagree with mnsp_generate.
     with open(os.path.splitext(out)[0] + ".txt", "w") as f:
         f.write("%d %d\n" % (music_id, grid))
-        f.write(",".join(str(v) for v in recorded) + "\n")
+        f.write(",".join(str(v) for v in positions) + "\n")
     print("wrote", out, "musicId", music_id, "grid", grid)
     return 0
 
