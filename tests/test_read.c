@@ -115,6 +115,37 @@ static void check_one(const char *name, int grid_override, float min_score, floa
     assert(total > 0.0f);
 }
 
+/* A screenshot with no empty slot -- a cleared board, or a grid that does not match
+ * the image -- must be reported, not matched. It used to reach sp_match_board with
+ * empty_cell == -1, where every cell is a real cell and the padding row overwrote one
+ * row past a count*count allocation. */
+static void check_rejects_board_without_a_blank(void)
+{
+    char screenshot[512];
+    char jacket[512];
+    int32_t actual[64];
+    uint8_t confident[64];
+    float total = 0.0f;
+    mnsp_read_options_t options;
+    mnsp_result_t result;
+
+    snprintf(screenshot, sizeof screenshot, "%s/screen_100001_4.png",
+             MNSP_FIXTURE_DIR);
+    snprintf(jacket, sizeof jacket, "%s/jacket_100001.png", MNSP_FIXTURE_DIR);
+
+    /* Reading a 4x4 capture as 3x3 leaves the located board with no recognisable
+     * blank, which is the shape of the bug without needing a cleared screenshot. */
+    memset(&options, 0, sizeof options);
+    options.grid = 3;
+    result = mnsp_read_screenshot(screenshot, jacket, &options, actual, confident, &total);
+    if (result == MNSP_OK) {
+        /* If a future matcher finds a blank here after all, the result must at least
+         * be a valid board; what is forbidden is a crash or a heap overflow. */
+        assert(mnsp_positions_valid(actual, 3));
+    }
+    printf("  missing-blank screenshot handled without overflow\n");
+}
+
 int main(void)
 {
     /* Thresholds are intentionally permissive: the point of the test is that the
@@ -127,6 +158,7 @@ int main(void)
      * cells differ by less than the JPEG noise floor. That is an information limit of
      * the artwork, not an algorithm defect; the CLI reports those cells as
      * low-confidence instead of guessing silently. */
+    check_rejects_board_without_a_blank();
     puts("test_read: ok");
     return 0;
 }

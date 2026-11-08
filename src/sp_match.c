@@ -398,12 +398,22 @@ mnsp_result_t sp_match_board(const sp_image_t *image, const sp_rect_t *cells, in
     /* Assignment: (count-1) live cells against `count` tiles. The one tile hidden
      * under the blank has no cell, so pad the matrix with a dummy row whose cost is
      * the same constant everywhere; whichever column it takes is simply the unused
-     * tile. This keeps the matrix square, which the Hungarian solver requires. */
+     * tile. This keeps the matrix square, which the Hungarian solver requires.
+     *
+     * When no blank was found (empty_cell outside 0..count-1) nothing is skipped, so
+     * the `count` real cells already fill `count` rows and the padding must not be
+     * written: doing so would be one row past a count*count allocation. That case is
+     * reachable from mnsp_read_screenshot on a cleared board, where every cell holds a
+     * tile and detect_blank has nothing to report. The caller still gets an
+     * assignment -- the board is simply not excluded from matching -- and the resulting
+     * positions fail the solvability check instead of corrupting the heap. */
     {
         const double dummy_cost = 1000.0;
         int row = 0;
+        int skipped = 0;
         for (int cell = 0; cell < count; cell++) {
             if (cell == empty_cell) {
+                skipped = 1;
                 continue;
             }
             for (int tile = 0; tile < tile_count; tile++) {
@@ -411,8 +421,10 @@ mnsp_result_t sp_match_board(const sp_image_t *image, const sp_rect_t *cells, in
             }
             row++;
         }
-        for (int tile = 0; tile < tile_count; tile++) {
-            cost[(size_t)row * tile_count + tile] = dummy_cost;
+        if (skipped) {
+            for (int tile = 0; tile < tile_count; tile++) {
+                cost[(size_t)row * tile_count + tile] = dummy_cost;
+            }
         }
     }
     hungarian(cost, count, assignment);

@@ -149,6 +149,14 @@ mnsp_result_t mnsp_read_screenshot(const char *screenshot_path, const char *jack
         return result;
     }
     blank_screen = detect_blank(&screen, cells, grid, NULL);
+    /* A board with no empty slot is either already cleared or the grid does not match
+     * the screenshot. Neither can be matched: the tile assignment assumes one cell is
+     * missing a tile. Report it rather than matching against a board that has no
+     * blank -- the caller cannot replay moves onto it anyway. */
+    if (blank_screen < 0) {
+        sp_image_free(&screen);
+        return MNSP_ERR_IMAGE;
+    }
 
     result = sp_image_load(jacket_path, &jacket);
     if (result != MNSP_OK) {
