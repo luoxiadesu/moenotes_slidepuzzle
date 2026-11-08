@@ -26,3 +26,12 @@ __pycache__/
 # Superseded, known-broken PDB (blank-costed patterns). Replaced by src/sp_pdb.c;
 # kept only as a research record in the workspace.
 work-in-progress/
+
+# dist/ is committed on purpose: it is the published solution set that downstream
+# consumers fetch, not a build artifact. Regenerate it with
+#   moenotes_slidepuzzle export --out dist --no-compress --deterministic --index
+# and improve single boards with tools/update_board.py. Only the scratch directories
+# the exporter and updater create are ignored.
+dist/.update-*/
+dist/*.tmp
+dist/.export.lock

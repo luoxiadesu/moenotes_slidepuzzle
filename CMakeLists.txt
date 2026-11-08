@@ -92,5 +92,30 @@ if(MOENOTES_BUILD_TESTS)
         # The suite shells out to the exporter; where no POSIX shell exists it prints a
         # skip notice and exits 77, which CTest reports as skipped rather than passed.
         set_tests_properties(export PROPERTIES SKIP_RETURN_CODE 77)
+
+        # The two maintenance scripts are what a downstream consumer actually runs
+        # against dist/: one verifies an export end to end (including the index), the
+        # other replaces a single board in place. Both are Python, so the tests only
+        # register where an interpreter exists. find_program rather than
+        # find_package(Python3) because the latter needs the CMake Python module to
+        # resolve an interpreter, which is not guaranteed on a bare machine.
+        find_program(MOENOTES_PYTHON3 NAMES python3 python)
+        if(MOENOTES_PYTHON3)
+            add_test(NAME verify_export
+                COMMAND ${MOENOTES_PYTHON3}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_export.py
+                        ${CMAKE_CURRENT_BINARY_DIR}/test-export --quiet)
+            add_test(NAME update_board
+                COMMAND ${MOENOTES_PYTHON3}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_update_board.py
+                        ${MOENOTES_PYTHON3}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/update_board.py
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_export.py
+                        $<TARGET_FILE:moenotes_slidepuzzle_cli>
+                        ${CMAKE_CURRENT_BINARY_DIR}/test-export/update)
+            set_tests_properties(verify_export update_board PROPERTIES
+                DEPENDS export)
+            set_tests_properties(update_board PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
     endif()
 endif()

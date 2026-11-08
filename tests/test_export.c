@@ -301,7 +301,22 @@ static void test_resume_rebuilds_truncated_gzip(void)
              "--resume >/dev/null 2>&1", MNSP_EXPORT_BINARY, dir);
     assert(system(command) == 0);
     assert(stat(path, &after) == 0);
-    assert(after.st_size == before.st_size);   /* rebuilt, not left at 500 */
+
+    /* Rebuilt, not left at 500. Comparing sizes against the first run would be
+     * fragile: the gzip byte count is not part of the contract, and the exporter
+     * regenerates the file from scratch. What matters is that the file now reads
+     * back whole, so that is what is asserted. */
+    assert(after.st_size > 500);
+    {
+        gzFile rebuilt = gzopen(path, "rb");
+        char line[65536];
+        int rows = 0;
+        assert(rebuilt != NULL);
+        while (gzgets(rebuilt, line, sizeof line) != NULL) {
+            rows++;
+        }
+        assert(gzclose(rebuilt) == Z_OK);   /* trailer verified: not truncated */
+    }
     printf("  --resume rebuilt a truncated gzip\n");
 }
 
@@ -386,6 +401,154 @@ static void test_resume_rejects_wrong_schema(void)
     printf("  --resume rebuilt a wrong-schema file\n");
 }
 
+/* A hand-edited or half-written index row can claim any grid. Seeding the next
+ * --resume run from it must not index the grids[] table out of bounds, and must not
+ * carry the unusable row forward. */
+static void test_resume_survives_malformed_index_rows(void)
+{
+    char dir[512];
+    char path[600];
+    char command[4096];
+
+    snprintf(dir, sizeof dir, "%s/badindex", MNSP_EXPORT_TEST_DIR);
+    snprintf(path, sizeof path, "%s/index.jsonl.gz", dir);
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --music 100001 --grid 3 --index "
+             ">/dev/null 2>&1", MNSP_EXPORT_BINARY, dir);
+    assert(system(command) == 0);
+
+    /* Overwrite the index with one good row plus three that cannot be used: a grid far
+     * past the array, a negative grid, and a line that is not JSON at all. */
+    snprintf(command, sizeof command,
+             "printf '%%s\\n' "
+             "'{\"musicId\":100001,\"grid\":3,\"file\":\"a\",\"solutionLength\":21,"
+             "\"solver\":\"s\",\"quality\":\"q\"}' "
+             "'{\"musicId\":999,\"grid\":9999,\"file\":\"x\",\"solutionLength\":1,"
+             "\"solver\":\"s\",\"quality\":\"q\"}' "
+             "'{\"musicId\":999,\"grid\":-5,\"file\":\"y\",\"solutionLength\":1,"
+             "\"solver\":\"s\",\"quality\":\"q\"}' "
+             "'garbage' "
+             "| gzip > \"%s.n\" && mv \"%s.n\" \"%s\"", path, path, path);
+    assert(system(command) == 0);
+
+    /* No --music, so the run takes the branch that tested grids[] for every row --
+     * the one that read out of bounds. Grid 4 only: the good row for grid 3 is for a
+     * board this run does not touch, so it has to survive. */
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --grid 4 --index --resume >/dev/null 2>&1",
+             MNSP_EXPORT_BINARY, dir);
+    assert(system(command) == 0);
+
+    /* The malformed rows must be gone; the untouched good row must survive. */
+    snprintf(command, sizeof command,
+             "zcat \"%s\" | grep -q '\"grid\":9999'", path);
+    assert(system(command) != 0);
+    snprintf(command, sizeof command,
+             "zcat \"%s\" | grep -q 'garbage'", path);
+    assert(system(command) != 0);
+    snprintf(command, sizeof command,
+             "zcat \"%s\" | grep -q '\"musicId\":100001,\"grid\":3'", path);
+    assert(system(command) == 0);
+    printf("  malformed index rows dropped, good rows kept\n");
+}
+
+/* The published index must be a single gzip member. Readers that stop after the first
+ * member (Java's GZIPInputStream, some HTTP clients) would otherwise see only the
+ * first row, and `gzip -l` reports the last member's sizes instead of the file's. */
+static void test_index_is_a_single_gzip_member(void)
+{
+    char dir[512];
+    char path[600];
+    char command[2048];
+    FILE *file;
+    unsigned char buffer[65536];
+    size_t read_bytes;
+    int members = 0;
+
+    snprintf(dir, sizeof dir, "%s/member", MNSP_EXPORT_TEST_DIR);
+    snprintf(path, sizeof path, "%s/index.jsonl.gz", dir);
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --grid 3 --music 100001 --music 100050 "
+             "--music 100003 --index >/dev/null 2>&1", MNSP_EXPORT_BINARY, dir);
+    assert(system(command) == 0);
+
+    /* A second run with --resume exercises the seeding path, which used to append its
+     * own stream on top of the seeded one. */
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --grid 4 --music 100003 --index --resume "
+             ">/dev/null 2>&1", MNSP_EXPORT_BINARY, dir);
+    assert(system(command) == 0);
+
+    file = fopen(path, "rb");
+    assert(file != NULL);
+    read_bytes = fread(buffer, 1, sizeof buffer, file);
+    fclose(file);
+    for (size_t i = 0; i + 2 < read_bytes; i++) {
+        if (buffer[i] == 0x1f && buffer[i + 1] == 0x8b && buffer[i + 2] == 0x08) {
+            members++;
+        }
+    }
+    assert(members == 1);
+
+    /* All four rows (three from the first run, one from the resumed run) are present.
+     * Counted by decompressing rather than shelling out, so the test does not depend on
+     * popen being declared with the C17 feature macros this project builds under. */
+    {
+        gzFile index = gzopen(path, "rb");
+        char line[1024];
+        int rows = 0;
+        assert(index != NULL);
+        while (gzgets(index, line, sizeof line) != NULL) {
+            rows++;
+        }
+        assert(gzclose(index) == Z_OK);
+        assert(rows == 4);
+    }
+    printf("  index is one gzip member with every row\n");
+}
+
+/* --deterministic must make two runs over the same inputs byte-identical. The solver
+ * already is; the wall-clock timing in the meta line is the only variable field. */
+static void test_deterministic_output(void)
+{
+    char dir_a[512];
+    char dir_b[512];
+    char path_a[600];
+    char path_b[600];
+    char command[2048];
+    unsigned char a[16384];
+    unsigned char b[16384];
+    FILE *file;
+    size_t size_a, size_b;
+
+    snprintf(dir_a, sizeof dir_a, "%s/det-a", MNSP_EXPORT_TEST_DIR);
+    snprintf(dir_b, sizeof dir_b, "%s/det-b", MNSP_EXPORT_TEST_DIR);
+    snprintf(path_a, sizeof path_a, "%s/100050_3.jsonl.gz", dir_a);
+    snprintf(path_b, sizeof path_b, "%s/100050_3.jsonl.gz", dir_b);
+
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --music 100050 --grid 3 --deterministic "
+             ">/dev/null 2>&1", MNSP_EXPORT_BINARY, dir_a);
+    assert(system(command) == 0);
+    snprintf(command, sizeof command,
+             "\"%s\" export --out \"%s\" --music 100050 --grid 3 --deterministic "
+             ">/dev/null 2>&1", MNSP_EXPORT_BINARY, dir_b);
+    assert(system(command) == 0);
+
+    file = fopen(path_a, "rb");
+    assert(file != NULL);
+    size_a = fread(a, 1, sizeof a, file);
+    fclose(file);
+    file = fopen(path_b, "rb");
+    assert(file != NULL);
+    size_b = fread(b, 1, sizeof b, file);
+    fclose(file);
+
+    assert(size_a > 0 && size_a == size_b);
+    assert(memcmp(a, b, size_a) == 0);
+    printf("  --deterministic produced identical bytes\n");
+}
+
 /* A full disk must fail the run, not silently produce a truncated file. The file-size
  * rlimit reproduces it without needing to fill a real filesystem: with SIGXFSZ ignored
  * the write returns EFBIG and the exporter reports the failure.
@@ -434,6 +597,9 @@ int main(void)
     test_numeric_options_are_strict();
     test_long_out_dir_is_rejected();
     test_resume_rejects_wrong_schema();
+    test_resume_survives_malformed_index_rows();
+    test_index_is_a_single_gzip_member();
+    test_deterministic_output();
     test_write_failure_is_reported();
     puts("test_export: ok");
     return 0;

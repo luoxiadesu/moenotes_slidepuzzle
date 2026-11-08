@@ -72,6 +72,7 @@ typedef struct export_options {
     int resume;
     int compress;
     int want_index;
+    int deterministic;   /* zero the timing field so runs are byte-identical */
     export_strategy_t strategy;
 } export_options_t;
 
@@ -603,7 +604,13 @@ static int export_board(const export_options_t *options, mnsp_pdb_t *pdb,
     sink_printf(out,
              ",\"solutionLength\":%d,\"solver\":\"%s\",\"quality\":\"%s\","
              "\"elapsedMs\":%.0f}\n",
-             count, result.solver, result.quality, result.elapsed_ms);
+             count, result.solver, result.quality,
+             /* --deterministic exists so two runs over the same inputs produce
+              * byte-identical files: a consumer can then address the output by hash
+              * and tell "already generated" from "regenerated differently". The
+              * solver itself is deterministic; the wall-clock timing is the only
+              * field that is not. */
+             options->deterministic ? 0.0 : result.elapsed_ms);
 
     if (write_steps(out, board, grid, moves, count) != count) {
         sink_close(out);
@@ -635,20 +642,27 @@ static int export_board(const export_options_t *options, mnsp_pdb_t *pdb,
 
 /* -------------------------------------------------------------------- index */
 
-/* Copies the current index into the temp file, dropping any row for a board that this
- * run is about to regenerate. Without this a selective `--resume --music X` would
- * leave the index describing only X. */
-static void seed_index_from_existing(const export_options_t *options)
+/* The index is written through one sink that stays open for the whole run.
+ *
+ * Writing it as one gzip stream rather than one stream per row keeps the file a
+ * single gzip member. Appending a fresh member per row was readable by zlib, Python
+ * and Node, all of which walk every member -- but `gzip -l` reports only the last
+ * member's sizes, and readers that stop after the first member (Java's
+ * GZIPInputStream among them) would see a single row and silently miss the rest. A
+ * downstream consumer discovers the board files through this index, so an index that
+ * some readers truncate is worse than no index.
+ *
+ * The price is that a run killed mid-way leaves no published index at all rather
+ * than a partial one: the file is only renamed into place after the run succeeds.
+ * --resume regenerates it from the board files, so nothing is lost. */
+static void seed_index_from_existing(const export_options_t *options,
+                                     export_sink_t *out)
 {
     char line[4096];
-    export_sink_t *out;
     int have_source = 0;
+    int dropped = 0;
 
-    if (!options->index_path_used) {
-        return;
-    }
-    out = sink_open_append(options->index_tmp_path, options->compress);
-    if (out == NULL) {
+    if (!options->index_path_used || out == NULL) {
         return;
     }
     {
@@ -667,20 +681,35 @@ static void seed_index_from_existing(const export_options_t *options)
                 long music = -1, grid = -1;
                 const char *p = strstr(line, "\"musicId\":");
                 int regenerate = 0;
+                int usable;
                 if (p != NULL) music = strtol(p + 10, NULL, 10);
                 p = strstr(line, "\"grid\":");
                 if (p != NULL) grid = strtol(p + 7, NULL, 10);
-                /* Only keep rows this run is not going to rewrite. */
-                for (int k = 0; k < options->music_count && !regenerate; k++) {
-                    if (options->music[k] == (int32_t)music &&
-                        options->grids[(int)grid]) {
+                /* A row can be malformed -- a hand-edited index, a file written by an
+                 * older build, a line cut in half by a full disk. Indexing grids[] with
+                 * whatever the line claims reads past the array (grid 9999), so rows
+                 * whose fields do not parse, or whose grid is outside the supported
+                 * range, are dropped instead. Dropping is safe here: the worst case is
+                 * that a row for an untouched board is missed, and --resume regenerates
+                 * it on the next run anyway. */
+                usable = (p != NULL) && music > 0 &&
+                         grid >= MNSP_MIN_GRID && grid <= MNSP_MAX_GRID &&
+                         strchr(line, '\n') != NULL;
+                if (!usable) {
+                    dropped++;
+                } else {
+                    /* Only keep rows this run is not going to rewrite. */
+                    for (int k = 0; k < options->music_count && !regenerate; k++) {
+                        if (options->music[k] == (int32_t)music &&
+                            options->grids[(int)grid]) {
+                            regenerate = 1;
+                        }
+                    }
+                    if (options->music_count == 0 && options->grids[(int)grid]) {
                         regenerate = 1;
                     }
                 }
-                if (options->music_count == 0 && options->grids[(int)grid]) {
-                    regenerate = 1;
-                }
-                if (!regenerate) {
+                if (usable && !regenerate) {
                     sink_printf(out, "%s", line);
                 }
             }
@@ -688,41 +717,66 @@ static void seed_index_from_existing(const export_options_t *options)
         if (gz_source != NULL) gzclose(gz_source);
         if (source != NULL) fclose(source);
     }
-    sink_close(out);
+    if (dropped > 0) {
+        fprintf(stderr,
+                "note: dropped %d malformed row(s) from the existing index\n", dropped);
+        fflush(stderr);
+    }
 }
 
-/* Appends one row per board.
- *
- * This open-per-row design is deliberate: the index is written as boards complete, so a
- * run that is interrupted still leaves an index covering everything written so far.
- * Opening in "ab" mode appends atomically enough for a single process; the run lock
- * keeps a second process out.
- *
- * The sink is used rather than a bare gzFile so --no-compress produces a plain text
- * index. It previously always compressed, which produced a file named index.jsonl
- * containing gzip bytes. */
+/* The run's single index writer. Opened once before any board is exported and closed
+ * after the last one, so the file is one gzip member (see the block comment above).
+ * NULL when --index was not given. */
+static export_sink_t *g_index_sink = NULL;
+
+/* Opens the temp index and seeds it from the existing one when --resume asked for a
+ * selective run. The seed rows go through the same stream as the new rows, so the
+ * published file stays a single gzip member. Returns 0 on success, -1 when the index
+ * could not be opened. */
+static int open_index(const export_options_t *options)
+{
+    if (!options->index_path_used) {
+        return 0;
+    }
+    g_index_sink = sink_open_append(options->index_tmp_path, options->compress);
+    if (g_index_sink == NULL) {
+        return -1;
+    }
+    if (options->resume) {
+        seed_index_from_existing(options, g_index_sink);
+    }
+    return 0;
+}
+
+/* Appends one row per board to the open index. */
 static int write_index(const export_options_t *options, int32_t music_id, int grid,
                        int solution_length, const char *solver, const char *quality)
 {
-    export_sink_t *index;
-    int status;
-
     if (options->index_path_used == 0) {
         return 0;
     }
-    /* Appended to a temporary file; renamed into place only after the whole run
-     * succeeds. An index written directly would be left truncated by a crash or a
-     * full disk, and a truncated gzip index parses right up to the cut. */
-    index = sink_open_append(options->index_tmp_path, options->compress);
-    if (index == NULL) {
+    if (g_index_sink == NULL) {
         return -1;
     }
-    sink_printf(index,
+    sink_printf(g_index_sink,
                 "{\"musicId\":%d,\"grid\":%d,\"file\":\"%d_%d.jsonl%s\","
                 "\"solutionLength\":%d,\"solver\":\"%s\",\"quality\":\"%s\"}\n",
                 (int)music_id, grid, (int)music_id, grid,
                 options->compress ? ".gz" : "", solution_length, solver, quality);
-    status = sink_close(index);
+    /* A write error is sticky in the sink; report it here so the caller counts the
+     * board as failed instead of waiting until close. */
+    return sink_failed(g_index_sink) ? -1 : 0;
+}
+
+/* Closes the run's index writer. Returns 0 on success. */
+static int close_index(void)
+{
+    int status;
+    if (g_index_sink == NULL) {
+        return 0;
+    }
+    status = sink_close(g_index_sink);
+    g_index_sink = NULL;
     return status;
 }
 
@@ -789,6 +843,9 @@ static void export_usage(FILE *out)
           "                     export always covers all boards\n"
           "  --resume           skip boards whose output file is already complete\n"
           "  --no-compress      write plain .jsonl instead of .jsonl.gz\n"
+          "  --deterministic    write a fixed 0 for elapsedMs so two runs over the\n"
+          "                     same inputs are byte-identical (the solutions already\n"
+          "                     are; the timing field is the only variable part)\n"
           "  --index            also maintain <out>/index.jsonl.gz\n"
           "\n"
           "The 5x5 pattern database is built once per run (about 217 s) and shared by\n"
@@ -870,6 +927,8 @@ static int parse_args(int argc, char **argv, export_options_t *options)
             options->resume = 1;
         } else if (strcmp(argv[i], "--no-compress") == 0) {
             options->compress = 0;
+        } else if (strcmp(argv[i], "--deterministic") == 0) {
+            options->deterministic = 1;
         } else if (strcmp(argv[i], "--index") == 0) {
             options->want_index = 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -974,15 +1033,16 @@ int mnsp_export_command(int argc, char **argv)
         }
     }
 
-    /* The index is appended to as boards complete, so clear it first; otherwise a
-     * second run would duplicate every row. */
+    /* The index is written as one stream for the whole run, so open it once here.
+     * The temp file is cleared first; --resume seeds it from the published index so
+     * rows for boards this run will not touch survive, and the rows written below
+     * replace their own (musicId, grid) entries. */
     if (options.index_path_used) {
         remove(options.index_tmp_path);
-        /* --resume means "continue", so the rows for boards this run did not touch
-         * have to survive. Seed the temp file with the existing index first, then the
-         * rows written below replace their own (musicId, grid) entries. */
-        if (options.resume) {
-            seed_index_from_existing(&options);
+        if (open_index(&options) != 0) {
+            fprintf(stderr, "moenotes_slidepuzzle: cannot open the index file\n");
+            release_lock();
+            return 1;
         }
     }
 
@@ -1048,9 +1108,15 @@ int mnsp_export_command(int argc, char **argv)
             planned, written, skipped, failed,
             (export_now_ms() - started) / 1000.0);
 
-    /* Publish the index only now: every board has been attempted and each row in the
-     * temp file corresponds to a board that really exists. */
-    if (options.index_path_used && failed == 0) {
+    /* Closing flushes the trailer; a failure there means the index is short a row or
+     * truncated, which is fatal for the run just like a per-board write failure. */
+    if (options.index_path_used && close_index() != 0) {
+        fprintf(stderr, "moenotes_slidepuzzle: the index could not be written\n");
+        failed++;
+        remove(options.index_tmp_path);
+    } else if (options.index_path_used && failed == 0) {
+        /* Publish only now: every board has been attempted and each row in the temp
+         * file corresponds to a board that really exists. */
         if (rename(options.index_tmp_path, options.index_path) != 0) {
             fprintf(stderr, "moenotes_slidepuzzle: cannot publish the index\n");
             failed++;
