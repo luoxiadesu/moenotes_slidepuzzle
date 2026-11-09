@@ -5,13 +5,53 @@
  */
 #include "moenotes_slidepuzzle.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#include <direct.h>
+#endif
+
 /* Implemented in moenotes_slidepuzzle_export.c: batch generation of every board. */
 int mnsp_export_command(int argc, char **argv);
+
+/* Creates `path` and every missing parent (mkdir -p). A single mkdir is not enough:
+ * the cache root is under XDG_CACHE_HOME, and on a fresh machine neither that
+ * directory nor anything below it exists yet. Returns 1 on success. */
+static int make_directories(const char *path)
+{
+    char buffer[1024];
+    size_t length = strlen(path);
+    size_t i;
+
+    if (length == 0 || length >= sizeof buffer) {
+        return 0;
+    }
+    memcpy(buffer, path, length + 1);
+    for (i = 1; i < length; i++) {
+        if (buffer[i] != '/') {
+            continue;
+        }
+        buffer[i] = '\0';
+#if defined(_WIN32)
+        (void)_mkdir(buffer);
+#else
+        (void)mkdir(buffer, 0755);
+#endif
+        buffer[i] = '/';
+    }
+#if defined(_WIN32)
+    (void)_mkdir(buffer);
+#else
+    if (mkdir(buffer, 0755) != 0 && errno != EEXIST) {
+        return 0;
+    }
+#endif
+    return 1;
+}
 
 static void usage(FILE *out)
 {
@@ -26,9 +66,10 @@ static void usage(FILE *out)
           "                              depends on size); lower it to bound peak memory\n"
           "        [--quality] [--quality-weight W] [--quality-nodes N]\n"
           "                              also try the pattern-database search first (5x5 only).\n"
-          "                              About 13% shorter paths on average; costs ~3 min of\n"
-          "                              table building and 486 MiB of RAM. Falls back to the\n"
-          "                              standard search when the node budget runs out.\n"
+          "                              About 13% shorter paths on average. The tables cost\n"
+          "                              486 MiB and are built once (about 3.5 min), then\n"
+          "                              cached and loaded in under a second. Falls back to\n"
+          "                              the standard search when the budget runs out.\n"
           "  solve-state <grid> <p0,p1,...>\n"
           "                              solve an arbitrary board\n"
           "  read <screenshot> <jacket> <grid> [--solve]\n"
@@ -201,10 +242,26 @@ static int command_solve(int argc, char **argv)
 
     /* --quality: try the pattern-database guided search first. It is available for 5x5
      * only and may exceed its node budget on hard boards, in which case we fall back
-     * to the regular path below. Building the tables takes about three minutes, so
-     * this is opt-in rather than a default. */
+     * to the regular path below. Building the tables costs about three and a half
+     * minutes, so the cache matters: with it, a second run loads in under a second.
+     * This is still opt-in rather than a default because of the 486 MiB footprint. */
     if (quality && strcmp(strategy, "undo") != 0) {
-        mnsp_pdb_t *pdb = mnsp_pdb_create((int)grid);
+        /* Prefer the cached tables. mnsp_pdb_create rebuilds every time, which made the
+         * previous behaviour "3m42s even when the tables already exist". The cache lives
+         * in the same tree the jacket downloader uses, matching the export command, so
+         * the two commands share one copy of the 486 MiB. */
+        mnsp_pdb_t *pdb;
+        char base[900];
+        char cache_dir[1024];
+        int have_cache = mnsp_jacket_cache_dir(base, sizeof base) != 0;
+        if (have_cache) {
+            snprintf(cache_dir, sizeof cache_dir, "%s/pdb-5", base);
+            /* A failed mkdir is not fatal: create_cached falls back to building. */
+            (void)make_directories(cache_dir);
+            pdb = mnsp_pdb_create_cached((int)grid, cache_dir);
+        } else {
+            pdb = mnsp_pdb_create((int)grid);
+        }
         if (pdb == NULL) {
             fprintf(stderr, "note: no pattern database for grid %ld; using the standard search\n",
                     grid);
