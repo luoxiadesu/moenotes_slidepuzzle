@@ -102,9 +102,7 @@ static int count_steps(gzFile file, int32_t *final_board, int grid, int *out_dec
     int32_t board[MAX_CELLS];
     int have_board = 0;
     int32_t replayed[MAX_CELLS];
-    int32_t initial[MAX_CELLS];
     int blank = -1;
-    int have_initial = 0;
 
     /* Metadata line. */
     if (gz_read_line(file, line, sizeof line) < 0) return -1;
@@ -116,17 +114,16 @@ static int count_steps(gzFile file, int32_t *final_board, int grid, int *out_dec
         declared = (int)strtol(p + 17, NULL, 10);
     }
     {
-        /* The caller only asserts on the final board, so the replay has to start from
-         * the board the file itself declares. */
+        /* The replay has to start from the board the file itself declares, not from the
+         * game's board: a file renamed from another board would otherwise be replayed
+         * against the wrong start and still reach the goal by luck. */
         const char *p = strstr(line, "\"initial\":");
         assert(p != NULL);
-        assert(parse_board(p + 10, grid, initial) == grid * grid);
-        memcpy(replayed, initial, sizeof(int32_t) * (size_t)(grid * grid));
+        assert(parse_board(p + 10, grid, replayed) == grid * grid);
         for (int cell = 0; cell < grid * grid; cell++) {
             if (replayed[cell] == -1) blank = cell;
         }
         assert(blank >= 0);
-        have_initial = 1;
     }
 
     while (gz_read_line(file, line, sizeof line) > 0) {
@@ -175,11 +172,10 @@ static int count_steps(gzFile file, int32_t *final_board, int grid, int *out_dec
         assert(p != NULL);
         assert(parse_board(p + 8, grid, board) == grid * grid);
         assert(memcmp(board, replayed, sizeof(int32_t) * (size_t)(grid * grid)) == 0);
-        memcpy(final_board, board, sizeof(int32_t) * (size_t)(grid * grid));
+        memcpy(final_board, replayed, sizeof(int32_t) * (size_t)(grid * grid));
         have_board = 1;
         steps++;
     }
-    assert(have_initial);
     if (!have_board && declared == 0) {
         return 0;
     }
