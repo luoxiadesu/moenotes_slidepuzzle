@@ -6,6 +6,11 @@ actually experience: every file parses as strict JSON, every step moves the tile
 claims to move into the blank it claims is blank, every intermediate board matches
 the one written, and the last board is the goal.
 
+The `move` letter is checked against `from`/`to` as well. A consumer that walks the
+tile endpoints will never notice a wrong letter, so a generation bug that flips only
+the vertical letters passes every other check here -- which is exactly what happened,
+and why this one is spelled out rather than left implied by the endpoints.
+
 Both the gzip'd (.jsonl.gz) and plain (.jsonl) forms are accepted, and a directory
 holding both is fine -- an incremental update can legitimately leave a mix.
 
@@ -45,6 +50,21 @@ def open_text(path):
     return open(path, "rt", encoding="utf-8")
 
 
+def expected_move(from_row, from_col, to_row, to_col):
+    """The `move` field names the blank's travel, which is the reverse of the tile's.
+
+    The tile goes from `from` to `to`; the blank goes from `to` to `from`. So a tile
+    that ends up in a higher row (on screen) means the blank moved down ("D").
+    """
+    if to_row < from_row:
+        return "D"  # tile moved up the screen, blank moved down
+    if to_row > from_row:
+        return "U"
+    if to_col < from_col:
+        return "R"  # tile moved left, blank moved right
+    return "L"
+
+
 def check_file(path):
     try:
         with open_text(path) as handle:
@@ -80,6 +100,13 @@ def check_file(path):
             break
         if board[to_row][to_col] != -1:
             problems.append(f"step {index}: destination is not blank")
+            break
+        want = expected_move(from_row, from_col, to_row, to_col)
+        if step.get("move") != want:
+            problems.append(
+                f"step {index}: move is {step.get('move')!r}, "
+                f"but from/to imply {want!r}"
+            )
             break
         board[from_row][from_col], board[to_row][to_col] = (
             board[to_row][to_col],

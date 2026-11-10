@@ -52,7 +52,7 @@ Exit codes: 0 success, 1 processing failure, 2 invalid arguments.
 | Command | Behaviour |
 |---|---|
 | `gen <musicId> <grid>` | Prints `solvable=`, a board view and the `tilePositions` line for the board the game would build. |
-| `solve <musicId> <grid> [--strategy auto\|search\|undo] [--max-states N] [--quality] [--quality-weight W] [--quality-nodes N]` | `auto` searches then replays the shuffle backwards; `search` fails instead of falling back; `undo` skips search. `--max-states` caps distinct boards explored (`mnsp_default_budget` when omitted). `--quality*` tries the PDB first (weight default 1.5, nodes default 200000000) and notes-then-continues where no PDB exists. It calls `mnsp_pdb_create`, not the cached entry point, so each run pays the ~3 min table build. **An unrecognised `--strategy` value is accepted silently and behaves as `auto`.** |
+| `solve <musicId> <grid> [--strategy auto\|search\|undo] [--max-states N] [--quality] [--quality-weight W] [--quality-nodes N]` | `auto` searches then replays the shuffle backwards; `search` fails instead of falling back; `undo` skips search. `--max-states` caps distinct boards explored (`mnsp_default_budget` when omitted). `--quality*` tries the PDB first (weight default 1.5, nodes default 200000000) and notes-then-continues where no PDB exists. It builds through `mnsp_pdb_create_cached`, so the ~3 min table build is paid once and later runs load the cached tables in well under a second. **An unrecognised `--strategy` value is accepted silently and behaves as `auto`.** |
 | `solve-state <grid> <p0,p1,...>` | Solves an arbitrary board; rejects a non-permutation, a board without exactly one `-1`, and a board `mnsp_solvable` calls unsolvable. |
 | `read <screenshot> <jacket> <grid> [--solve]` | Recovers `tilePositions`; prints `totalScore`, prints low-confidence cells to stderr, and fails when more than a quarter of cells are low-confidence. `--solve` only takes effect as the **last** argument. |
 | `read-music <screenshot> <musicId> <grid> [--solve] [--offline]` | Resolves the jacket from the cache (fetching unless `--offline`), then runs `read`. |
@@ -111,11 +111,26 @@ gzip trailer (plain files must end with a newline), and its meta line's
 `schema`/`musicId`/`grid`/`solutionLength` match the current task.
 
 **`dist/` is committed**, not generated at build time: 504 board files (84 songs x 3-8)
-plus `index.jsonl`, ~19.5 MB of plain JSONL, produced with
-`export --out dist --deterministic --no-compress --index` (every `elapsedMs` is 0). By
-`solver`: 168 `exact-astar`, 84 `pdb-w1.5`, 252 `ladder`. Longest solution 566 moves
-(100052, 8x8); largest file 160,018 bytes; `tools/verify_export.py dist` reports
-`505 files checked, 0 with problems`.
+plus `index.jsonl`, ~19.5 MB of plain JSONL. 77 of the 84 5x5 boards were replaced with
+a provably shortest path; every other board, including the 7 5x5 boards still on the
+weighted search, comes from
+`export --out dist --deterministic --no-compress --index`, so their `elapsedMs` is 0.
+By `solver`: 168 `exact-astar`, 77 `pdb-exact`, 7 `pdb-w1.5`, 252 `ladder`.
+Longest solution 566 moves (100052, 8x8); largest file 160,018 bytes;
+`tools/verify_export.py dist` reports `505 files checked, 0 with problems`.
+
+`quality` records the guarantee the search actually earned, not a measured ratio. A 5x5
+board solved by the weighted search is `near-optimal` even when its path happens to be
+shortest, because that run never proved it: only `pdb-exact` (exact IDA\*, w=1) does.
+The upgraded boards carry the real wall-clock of their exhaustive search in `elapsedMs`
+(up to ~1432 s) rather than 0, since they did not come from a `--deterministic` run --
+that search takes minutes to hours per board and re-running all of them just to zero a
+timing field was not worth it. `dist/` is therefore reproducible with `--deterministic`
+for every size except the 5x5 boards upgraded this way.
+
+`tools/verify_export.py` checks the `move` letter against `from`/`to`, not just the
+replayed board. A generator bug that flipped only the vertical letters passed every
+endpoint-based check; the letter check is what catches it.
 
 `tools/update_board.py <dir> <musicId> <grid> [--strategy S] [--dry-run] [--binary PATH]`
 re-solves one board with the real exporter, refuses to replace a file with a longer

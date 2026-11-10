@@ -1,10 +1,12 @@
 /* Contract tests for the batch exporter.
  *
  * The exporter is a file producer, so these tests run it and read what it wrote rather
- * than calling an API. Two properties matter most:
+ * than calling an API. Three properties matter most:
  *
- *   1. Replaying the step lines must reproduce the board at every step and finish on
- *      the goal. A single wrong move here silently ships broken puzzles downstream.
+ *   1. Replaying the step lines from the declared `initial` board must reproduce the
+ *      board of every step and finish on the goal, and the `move` letter must agree with
+ *      the tile's `from`/`to` endpoints. A single wrong move here silently ships broken
+ *      puzzles downstream.
  *   2. The JSON must be parseable by a strict reader. The generator has no JSON
  *      library, so the escaping and the array shape are checked by hand.
  *
@@ -99,6 +101,10 @@ static int count_steps(gzFile file, int32_t *final_board, int grid, int *out_dec
     int declared = -1;
     int32_t board[MAX_CELLS];
     int have_board = 0;
+    int32_t replayed[MAX_CELLS];
+    int32_t initial[MAX_CELLS];
+    int blank = -1;
+    int have_initial = 0;
 
     /* Metadata line. */
     if (gz_read_line(file, line, sizeof line) < 0) return -1;
@@ -109,10 +115,26 @@ static int count_steps(gzFile file, int32_t *final_board, int grid, int *out_dec
         assert(p != NULL);
         declared = (int)strtol(p + 17, NULL, 10);
     }
+    {
+        /* The caller only asserts on the final board, so the replay has to start from
+         * the board the file itself declares. */
+        const char *p = strstr(line, "\"initial\":");
+        assert(p != NULL);
+        assert(parse_board(p + 10, grid, initial) == grid * grid);
+        memcpy(replayed, initial, sizeof(int32_t) * (size_t)(grid * grid));
+        for (int cell = 0; cell < grid * grid; cell++) {
+            if (replayed[cell] == -1) blank = cell;
+        }
+        assert(blank >= 0);
+        have_initial = 1;
+    }
 
     while (gz_read_line(file, line, sizeof line) > 0) {
         const char *p;
         int index;
+        char move;
+        int from_row, from_col, to_row, to_col;
+        char want;
 
         assert(strstr(line, "\"type\":\"step\"") != NULL);
         p = strstr(line, "\"index\":");
@@ -120,13 +142,44 @@ static int count_steps(gzFile file, int32_t *final_board, int grid, int *out_dec
         index = (int)strtol(p + 8, NULL, 10);
         assert(index == steps + 1);
 
+        /* `move` names the blank's travel while `from`/`to` are the tile's endpoints,
+         * so the letter is the reverse of the tile's direction. Checking it here is the
+         * only place the writer's letter mapping is exercised: a flipped vertical
+         * mapping still lands every replay on the goal and is invisible to a consumer
+         * that animates from/to. */
+        p = strstr(line, "\"move\":\"");
+        assert(p != NULL);
+        move = p[8];
+        p = strstr(line, "\"from\":[");
+        assert(p != NULL);
+        assert(sscanf(p + 8, "%d,%d", &from_row, &from_col) == 2);
+        p = strstr(line, "\"to\":[");
+        assert(p != NULL);
+        assert(sscanf(p + 6, "%d,%d", &to_row, &to_col) == 2);
+        if (to_row < from_row) want = 'D';
+        else if (to_row > from_row) want = 'U';
+        else if (to_col < from_col) want = 'R';
+        else want = 'L';
+        assert(move == want);
+        assert(replayed[from_row * grid + from_col] != -1);
+        assert(replayed[to_row * grid + to_col] == -1);
+        assert(blank == to_row * grid + to_col);
+        {
+            int32_t tile = replayed[from_row * grid + from_col];
+            replayed[to_row * grid + to_col] = tile;
+            replayed[from_row * grid + from_col] = -1;
+            blank = from_row * grid + from_col;
+        }
+
         p = strstr(line, "\"board\":");
         assert(p != NULL);
         assert(parse_board(p + 8, grid, board) == grid * grid);
+        assert(memcmp(board, replayed, sizeof(int32_t) * (size_t)(grid * grid)) == 0);
         memcpy(final_board, board, sizeof(int32_t) * (size_t)(grid * grid));
         have_board = 1;
         steps++;
     }
+    assert(have_initial);
     if (!have_board && declared == 0) {
         return 0;
     }
